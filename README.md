@@ -1,5 +1,3 @@
----
-
 # ⛏️ Minecraft Wiki 知识库智能助手 (RAG-MCwiki)
 
 本项目是一个专为 **Minecraft** 玩家和研究者设计的本地化知识检索增强生成（RAG）系统。通过采集并结构化 Minecraft Wiki 数据（2026/4/22），结合本地大模型（Local LLM）与云端 API，实现精准、低延迟、无幻觉的游戏机制问答。
