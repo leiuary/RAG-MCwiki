@@ -6,5 +6,6 @@
 /mc_wiki_archive.jsonl
 /progress_state.json
 /test_hf.py
-__pycache__/rag_app.cpython-314.pyc
+/__pycache__/
 rag_app1.py
+/data/

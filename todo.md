@@ -81,3 +81,32 @@
 
    1     retriever.invoke(query, filter={"platform": "Java"})
    * 效果： 如果用户问 Java 版，数据库连一条基岩版的文档都不会吐出来。
+
+
+    1 RAG-MCwiki/
+    2 ├── backend/                # 🐍 Python 后端 (FastAPI)
+    3 │   ├── app/
+    4 │   │   ├── api/            # 路由定义 (chat, knowledge_base)
+    5 │   │   ├── core/           # RAG 核心逻辑 (LangChain 编排)
+    6 │   │   ├── services/       # 业务逻辑 (分词、向量化任务)
+    7 │   │   ├── schemas/        # 数据模型 (Pydantic, 定义接口输入输出)
+    8 │   │   └── utils/          # 工具类 (日志、文件处理)
+    9 │   ├── main.py             # 后端入口
+   10 │   └── requirements.txt
+   11 ├── frontend/               # ⚛️ React 前端 (Next.js)
+   12 │   ├── app/                # Next.js App Router (页面路由)
+   13 │   ├── components/         # 核心组件 (Chat, Sidebar, SourceCard)
+   14 │   ├── hooks/              # 自定义 Hook (处理 API 请求和状态)
+   15 │   ├── public/             # 静态资源 (Minecraft 像素图、图标)
+   16 │   ├── styles/             # 样式文件 (Tailwind CSS, Minecraft 字体)
+   17 │   └── package.json
+   18 ├── data/                   # 📂 数据持久化层
+   19 │   ├── structured/         # 清洗后的 Wiki JSON (原 structured_output)
+   20 │   ├── chroma_db/          # 向量数据库持久化文件
+   21 │   └── raw/                # 原始爬取数据 (可选)
+   22 ├── scripts/                # 🛠️ 独立工具脚本
+   23 │   ├── crawler.py          # 爬虫脚本
+   24 │   └── build_index.py      # 离线构建向量库的脚本
+   25 ├── .env                    # 🔑 环境变量 (API Keys, 数据库路径)
+   26 ├── docker-compose.yml      # (可选) 一键部署前后端
+   27 └── README.md
