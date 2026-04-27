@@ -33,6 +33,43 @@
 
 ## 🚀 快速开始
 
+### 一键启动（Windows PowerShell）
+
+如果你觉得手动开两个服务太麻烦，可以直接用脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1
+```
+
+这个脚本会自动：
+- 启动后端 FastAPI（`http://localhost:8000`）
+- 启动前端 Next.js（`http://localhost:3000`）
+- 如果前端缺少依赖，会自动 `npm install`
+
+可选参数：
+
+```powershell
+# 仅启动后端
+powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -SkipFrontend
+
+# 仅启动前端
+powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -SkipBackend
+
+# 不自动安装前端依赖
+powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -NoInstall
+```
+
+停止服务（按端口 8000/3000 关闭）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dev-down.ps1
+```
+
+也可以直接双击根目录下的批处理文件：
+
+- `start-dev.bat`：启动前后端
+- `stop-dev.bat`：停止前后端
+
 ### 1. 环境准备
 确保你的环境中已安装 Python 3.10+。建议使用虚拟环境：
 
