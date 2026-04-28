@@ -3,16 +3,38 @@ export interface Source {
   section?: string;
   source_url: string;
   content: string;
+  content_length?: number;
+  content_preview?: string;
+}
+
+export interface StepDurations {
+  [step: string]: number;
+}
+
+export interface LLMConfig {
+  backend: string;
+  base_url: string;
+  model: string;
+  temperature: number;
+  streaming: boolean;
 }
 
 export interface TraceData {
+  status?: string;
   user_input?: string;
   model_choice?: string;
   answer_detail?: string;
   search_terms?: string[];
   retrieved_chunk_count?: number;
   retrieve_time_ms?: number;
+  context_total_chars?: number;
+  first_context_ms?: number;
   system_prompt?: string;
+  llm_config?: LLMConfig;
+  step_durations_ms?: StepDurations;
+  execution_mode?: string;
+  fallback_used?: boolean;
+  fallback_reason?: string;
   ttft_ms?: number;
   total_time_ms?: number;
   output_chars?: number;
@@ -72,11 +94,21 @@ export function syncKnowledgeBase(model?: string) {
   });
 }
 
+export function getModels(provider: string, baseUrl?: string, apiKey?: string) {
+  return requestJson<{ models: string[] }>('/api/v1/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, base_url: baseUrl, api_key: apiKey }),
+  });
+}
+
 export async function* streamChat(
   message: string,
   model_choice: string = 'local',
   api_key?: string,
-  answer_detail: string = '标准'
+  answer_detail: string = '标准',
+  base_url?: string,
+  model_name?: string
 ) {
   const response = await fetch(`${API_BASE_URL}/api/v1/chat`, {
     method: 'POST',
@@ -88,6 +120,8 @@ export async function* streamChat(
       model_choice,
       api_key,
       answer_detail,
+      base_url,
+      model_name
     }),
   });
 

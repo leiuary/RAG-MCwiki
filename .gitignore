@@ -6,8 +6,11 @@
 /mc_wiki_archive.jsonl
 /progress_state.json
 /test_hf.py
-/__pycache__/
+__pycache__/
 rag_app1.py
 /data/
 /参考/
 .sisyphus/ralph-loop.local.md
+.claude/
+GEMINI.md
+CLAUDE.md

@@ -1,292 +1,298 @@
-import os
-import json
-import shutil
-import sqlite3
-import time
 import hashlib
 import logging
-import threading
-from datetime import datetime, timezone
-import jieba
+import asyncio
+import ipaddress
+from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 
 from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-class RAGEngine:
-    def __init__(self):
-        self.embeddings = None
-        self.embedding_model_name = settings.EMBEDDING_MODEL_NAME
-        self.vectorstore = None
-        self.retriever = None
-        self._lock = threading.RLock()
-        self.stopwords = {"的", "是", "了", "在", "怎么", "什么", "和", "与", "如何", "帮我", "查一下", "告诉我", "有哪些"}
+_PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+]
 
-    def _init_embeddings(self, model_name: str):
-        self.embedding_model_name = model_name
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=model_name,
-            encode_kwargs={"normalize_embeddings": True}
-        )
-        
-    def init_models(self):
-        """初始化 Embedding 模型和向量库"""
-        with self._lock:
-            logger.info("正在初始化 Embedding 模型...")
-            self._init_embeddings(settings.EMBEDDING_MODEL_NAME)
 
-            data_signature = self._compute_data_signature(settings.DATA_DIR)
+def _validate_llm_url(url: str, provider: str) -> None:
+    """校验 LLM base_url 防止 SSRF。local 提供者允许 localhost；api 提供者只允许已知外部域名。"""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
 
-            if self._is_vectorstore_ready(settings.PERSIST_DIR, data_signature):
-                logger.info("连接到现有向量库...")
-                self.vectorstore = Chroma(
-                    persist_directory=settings.PERSIST_DIR,
-                    embedding_function=self.embeddings
-                )
-            else:
-                logger.info("向量库不存在或已过期，开始构建...")
-                self._build_vectorstore(data_signature)
-
-            self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
-
-    def rebuild_vectorstore(self, model_name: Optional[str] = None):
-        """按指定 embedding 模型重建向量库"""
-        with self._lock:
-            selected_model = model_name or self.embedding_model_name or settings.EMBEDDING_MODEL_NAME
-            logger.info(f"使用 Embedding 模型重建向量库: {selected_model}")
-            self._init_embeddings(selected_model)
-            data_signature = self._compute_data_signature(settings.DATA_DIR)
-            self._build_vectorstore(data_signature)
-            self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": settings.RETRIEVAL_K})
-
-    def clean_vectorstore(self):
-        """清理向量库"""
-        with self._lock:
-            if os.path.exists(settings.PERSIST_DIR):
-                shutil.rmtree(settings.PERSIST_DIR)
-            self.vectorstore = None
-            self.retriever = None
-            logger.info("向量库已清理")
-
-    def get_runtime_status(self) -> Dict[str, Any]:
-        with self._lock:
-            state_path = os.path.join(settings.PERSIST_DIR, "build_state.json")
-            version = "unknown"
-            if os.path.exists(state_path):
-                try:
-                    with open(state_path, "r", encoding="utf-8") as f:
-                        state = json.load(f)
-                    version = state.get("built_at") or "unknown"
-                except Exception:
-                    version = "unknown"
-
-            return {
-                "ready": self.retriever is not None,
-                "embedding_model": self.embedding_model_name,
-                "version": version,
-            }
-
-    def _compute_data_signature(self, folder_path: str) -> str:
-        if not os.path.isdir(folder_path):
-            return ""
-        hasher = hashlib.sha256()
-        json_files = sorted(f for f in os.listdir(folder_path) if f.endswith(".json"))
-        for filename in json_files:
-            file_path = os.path.join(folder_path, filename)
-            try:
-                stat = os.stat(file_path)
-                hasher.update(filename.encode("utf-8"))
-                hasher.update(str(stat.st_size).encode("ascii"))
-                hasher.update(str(stat.st_mtime_ns).encode("ascii"))
-            except OSError:
-                continue
-        return hasher.hexdigest()
-
-    def _is_vectorstore_ready(self, persist_dir: str, data_signature: str) -> bool:
-        state_path = os.path.join(persist_dir, "build_state.json")
-        if not os.path.exists(state_path):
-            return False
+    if provider == "local":
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return
         try:
-            with open(state_path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            if state.get("status") == "complete" and state.get("data_signature") == data_signature:
-                sqlite_path = os.path.join(persist_dir, "chroma.sqlite3")
-                return os.path.exists(sqlite_path)
-        except Exception:
-            return False
-        return False
+            addr = ipaddress.ip_address(host)
+            if addr.is_private or addr.is_loopback or addr.is_link_local:
+                return
+        except ValueError:
+            pass
 
-    def _build_vectorstore(self, data_signature: str):
-        if os.path.exists(settings.PERSIST_DIR):
-            shutil.rmtree(settings.PERSIST_DIR)
-        os.makedirs(settings.PERSIST_DIR, exist_ok=True)
-        
-        documents = []
-        json_files = [f for f in os.listdir(settings.DATA_DIR) if f.endswith(".json")]
-        total_files = len(json_files)
-        logger.info(f"开始加载 {total_files} 个知识文件...")
-        
-        # 引入分词器作为兜底，防止单个章节过长
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-        
-        for idx, filename in enumerate(json_files):
-            if idx % 100 == 0:
-                logger.info(f"加载进度: {idx}/{total_files}...")
-            filepath = os.path.join(settings.DATA_DIR, filename)
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            title = data.get('title', '未知标题')
-            source_url = data.get('source_url', '')
-            
-            # 2.1 结构化分片：以章节 (Section) 为基本单位
-            if 'structured_content' in data:
-                for section_title, text_list in data['structured_content'].items():
-                    section_text = "\n".join([t for t in text_list if t.strip()])
-                    if not section_text: continue
-                    
-                    full_content = f"## {title} - {section_title} ##\n{section_text}"
-                    
-                    # 如果章节内容适中，直接作为一个 Doc；如果太长则二次切分
-                    if len(full_content) < 1000:
-                        documents.append(Document(
-                            page_content=full_content,
-                            metadata={'title': title, 'section': section_title, 'source_url': source_url}
-                        ))
-                    else:
-                        sub_docs = text_splitter.create_documents(
-                            [full_content], 
-                            metadatas=[{'title': title, 'section': section_title, 'source_url': source_url}]
-                        )
-                        documents.append(sub_docs)
-            else:
-                text = data.get('text', '')
-                if text:
-                    documents.append(text_splitter.create_documents(
-                        [text], 
-                        metadatas=[{'title': title, 'source_url': source_url}]
-                    ))
-        
-        # 处理嵌套列表
-        flattened_docs = []
-        for d in documents:
-            if isinstance(d, list): flattened_docs.extend(d)
-            else: flattened_docs.append(d)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(f"不支持的协议: {parsed.scheme}")
 
-        logger.info(f"结构化分片完成，共生成 {len(flattened_docs)} 个片段")
-        self.vectorstore = Chroma.from_documents(
-            documents=flattened_docs,
-            embedding=self.embeddings,
-            persist_directory=settings.PERSIST_DIR
-        )
-        
-        with open(os.path.join(settings.PERSIST_DIR, "build_state.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "status": "complete",
-                    "data_signature": data_signature,
-                    "embedding_model": self.embedding_model_name,
-                    "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                },
-                f,
-            )
+    if provider != "local":
+        if parsed.scheme != "https":
+            raise ValueError("云端 API 必须使用 HTTPS")
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return
+
+    for r in _PRIVATE_IP_RANGES:
+        if addr in r:
+            raise ValueError(f"不允许访问内网地址: {host}")
+
+
+class RAGEngine:
+    """对话检索引擎，依赖外部注入的 KnowledgeBaseManager 提供向量库。"""
+
+    def __init__(self, kb_manager=None):
+        self.kb = kb_manager
+        self.sessions: Dict[str, List[Dict]] = {}
+        self.max_history_window = 10
+
+    @property
+    def retriever(self):
+        return self.kb.retriever if self.kb else None
+
+    # ── 检索 ──
 
     async def _transform_query(self, query: str, llm) -> List[str]:
-        """2.2 Query 改写：将用户口语转化为精准的搜索短语"""
+        """Query 改写：将用户口语转化为精准的搜索短语。"""
         prompt = (
             "你是一个Minecraft搜索专家。请将用户的提问改写为3个用于知识库检索的短语。\n"
-            "要求：\n"
-            "1. 包含核心实体（如 Java版, 红石, 26.1等）\n"
-            "2. 使用维基百科风格的术语\n"
-            "3. 只输出短语，每行一个，不要有其他解释。\n\n"
+            "要求：1. 包含核心实体；2. 使用维基风格术语；3. 只输出短语，每行一个。\n\n"
             f"用户问题：{query}"
         )
         try:
-            # 简单调用模型生成，这里不使用流式
-            response = await llm.ainvoke(prompt)
+            response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=10.0)
             lines = response.content.strip().split("\n")
-            # 清洗结果
             transformed = [l.strip("- ").strip() for l in lines if l.strip()]
-            logger.info(f"Query 改写结果: {transformed}")
             return transformed[:3]
+        except asyncio.TimeoutError:
+            logger.warning("Query 改写超时，使用原句检索")
+            return [query]
         except Exception as e:
             logger.error(f"Query 改写失败: {e}")
             return [query]
 
     async def retrieve(self, query: str, llm=None) -> tuple[List[Document], List[str]]:
-        """整合改写后的查询逻辑"""
+        """整合改写后的多路向量检索。"""
         search_terms = [query]
         if llm:
             transformed = await self._transform_query(query, llm)
             search_terms.extend(transformed)
 
         all_docs = []
-        with self._lock:
+        with self.kb._lock:
             current_retriever = self.retriever
             if not current_retriever:
                 return [], search_terms
 
-            # 移除原有的 jieba 逻辑，改为基于改写后的多路向量检索
             for term in set(search_terms):
                 all_docs.extend(current_retriever.invoke(term))
-            
+
         # 语义去重
         unique_docs = []
         seen_content = set()
         for doc in all_docs:
-            # 简单的内容 hash 去重
             content_hash = hashlib.md5(doc.page_content.encode()).hexdigest()
             if content_hash not in seen_content:
                 unique_docs.append(doc)
                 seen_content.add(content_hash)
-        
+
         return unique_docs[:8], search_terms
 
-    def get_chat_model(self, model_choice: str, api_key: Optional[str] = None):
-        if model_choice == "local":
-            return ChatOpenAI(
-                base_url=settings.LOCAL_LLM_URL,
-                api_key="lm-studio",
-                model="Qwen/Qwen3.5-9B",
-                temperature=0.7,
-                streaming=True
-            )
-        else:
-            return ChatOpenAI(
-                base_url=settings.DEEPSEEK_API_URL,
-                api_key=api_key,
-                model="deepseek-chat",
-                temperature=0.1,
-                streaming=True
-            )
+    # ── 会话管理 ──
 
-    def get_qa_chain(self, llm, answer_detail="标准"):
+    def get_session_history(self, session_id: str) -> List[Dict]:
+        if session_id not in self.sessions:
+            self.sessions[session_id] = []
+        return self.sessions[session_id]
+
+    def add_to_session(self, session_id: str, role: str, content: str):
+        history = self.get_session_history(session_id)
+        history.append({"role": role, "content": content})
+        if len(history) > self.max_history_window * 2:
+            self.sessions[session_id] = history[-(self.max_history_window * 2):]
+
+    def format_history_for_chain(self, history: List[Dict]) -> List:
+        result = []
+        for msg in history:
+            if msg["role"] == "user":
+                result.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                result.append(AIMessage(content=msg["content"]))
+        return result
+
+    # ── 共享对话逻辑 ──
+
+    async def chat(
+        self,
+        message: str,
+        model_choice: str = "api",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model_name: Optional[str] = None,
+        answer_detail: str = "标准",
+        session_id: Optional[str] = None,
+        streaming: bool = True,
+    ) -> dict:
+        if not self.retriever:
+            raise RuntimeError("RAG Engine not initialized")
+
+        llm, llm_config = self.get_chat_model(
+            model_choice, api_key, base_url, model_name,
+            streaming=streaming,
+        )
+        system_prompt = self.build_system_prompt(answer_detail)
+
+        docs, search_terms = await self.retrieve(message, llm=llm)
+
+        include_history = session_id is not None
+        qa_chain = self.get_qa_chain(llm, answer_detail, include_history=include_history)
+
+        chain_input: dict = {"input": message, "context": docs}
+        if include_history:
+            history = self.get_session_history(session_id)
+            chain_input["chat_history"] = self.format_history_for_chain(history)
+
+        if streaming:
+            return {
+                "qa_chain": qa_chain,
+                "chain_input": chain_input,
+                "docs": docs,
+                "search_terms": search_terms,
+                "llm_config": llm_config,
+                "system_prompt": system_prompt,
+            }
+
+        try:
+            result = await qa_chain.ainvoke(chain_input)
+            content = result if isinstance(result, str) else str(result)
+        except Exception:
+            logger.warning("ainvoke 失败，尝试不带历史重试")
+            chain_input["chat_history"] = []
+            try:
+                result = await qa_chain.ainvoke(chain_input)
+                content = result if isinstance(result, str) else str(result)
+            except Exception as e2:
+                raise RuntimeError(f"对话调用失败: {e2}") from e2
+
+        if session_id is not None:
+            self.add_to_session(session_id, "user", message)
+            self.add_to_session(session_id, "assistant", content)
+
+        return {
+            "content": content,
+            "docs": docs,
+            "search_terms": search_terms,
+            "llm_config": llm_config,
+            "system_prompt": system_prompt,
+        }
+
+    async def list_models(self, provider: str, base_url: Optional[str] = None, api_key: Optional[str] = None) -> List[str]:
+        """从指定供应商获取可用模型列表。"""
+        url = (base_url or (settings.LOCAL_LLM_URL if provider == "local" else settings.DEEPSEEK_API_URL)).rstrip('/')
+        _validate_llm_url(url, provider)
+        key = "lm-studio" if provider == "local" else api_key
+
+        test_urls = [f"{url}/models"]
+        if "/v1" not in url:
+            test_urls.insert(0, f"{url}/v1/models")
+
+        import httpx
+        errors = []
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            for target_url in test_urls:
+                try:
+                    response = await client.get(
+                        target_url,
+                        headers={"Authorization": f"Bearer {key}"} if key else {}
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        if "data" in data and isinstance(data["data"], list):
+                            return [m["id"] for m in data["data"]]
+                    else:
+                        errors.append(f"{target_url} 返回状态码 {response.status_code}")
+                except Exception as e:
+                    errors.append(f"请求 {target_url} 失败: {str(e)}")
+
+        error_msg = " | ".join(errors[-2:])
+        logger.error(f"获取模型列表失败: {error_msg}")
+        raise Exception(f"模型列表拉取失败: {error_msg}")
+
+    def get_chat_model(self, model_choice: str, api_key: Optional[str] = None, base_url: Optional[str] = None, model_name: Optional[str] = None, streaming: bool = True):
+        url = base_url
+        key = api_key
+        name = model_name
+
+        if model_choice == "local":
+            url = url or settings.LOCAL_LLM_URL
+            key = key or "lm-studio"
+            name = name or "Qwen/Qwen3.5-9B"
+            backend = "LM Studio"
+        else:
+            url = url or settings.DEEPSEEK_API_URL
+            name = name or "deepseek-chat"
+            backend = "DeepSeek API"
+
+        _validate_llm_url(url, model_choice)
+
+        config = {
+            "backend": backend,
+            "base_url": url,
+            "model": name,
+            "temperature": 1.0,
+            "streaming": streaming,
+        }
+
+        return ChatOpenAI(
+            base_url=url,
+            api_key=key,
+            model=name,
+            temperature=1.0,
+            streaming=streaming,
+        ), config
+
+    @staticmethod
+    def build_system_prompt(answer_detail="标准"):
         detail_reqs = {
             "简洁": "回答控制在3到5句，聚焦关键结论。",
             "标准": "先给结论，再给步骤，步骤不少于5条，并补充1到2条注意事项。",
-            "详细": "按“结论 -> 具体步骤 -> 材料清单 -> 常见错误 -> 进阶优化”输出，步骤不少于8条。"
+            "详细": "按「结论 → 具体步骤 → 材料清单 → 常见错误 → 进阶优化」输出，步骤不少于8条。",
         }
-        
-        system_prompt = (
+        return (
             "你是一个Minecraft知识库智能助手。请使用以下检索到的背景信息来回答问题。\n"
             "如果你不知道答案，就说你不知道，不要编造。\n"
             f"回答详细度要求：{detail_reqs.get(answer_detail, detail_reqs['标准'])}\n\n"
             "背景信息：\n{context}"
         )
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}"),
-        ])
+
+    def get_qa_chain(self, llm, answer_detail="标准", include_history=False):
+        system_prompt = self.build_system_prompt(answer_detail)
+        messages = [("system", system_prompt)]
+        if include_history:
+            messages.append(MessagesPlaceholder(variable_name="chat_history"))
+        messages.append(("human", "{input}"))
+        prompt = ChatPromptTemplate.from_messages(messages)
         return create_stuff_documents_chain(llm, prompt)
 
-rag_engine = RAGEngine()
+
+rag_engine = RAGEngine()  # kb_manager 由 main.py 在启动时注入
