@@ -8,7 +8,10 @@ import {
   ChatMessage,
   streamChat,
   getKnowledgeBaseStatus,
+  getEmbeddingModels,
+  switchEmbeddingModel,
   KnowledgeBaseStatus,
+  EmbeddingModelInfo,
 } from "./services/api";
 import LeftSidebar from "../components/LeftSidebar";
 import RightSidebar from "../components/RightSidebar";
@@ -38,6 +41,8 @@ export default function Home() {
   const [modelName, setModelName] = useState("");
   const [answerDetail, setAnswerDetail] = useState("标准");
   const [professionalMode, setProfessionalMode] = useState(false);
+  const [embeddingModelId, setEmbeddingModelId] = useState("");
+  const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -53,6 +58,11 @@ export default function Home() {
       try {
         const status = await getKnowledgeBaseStatus();
         setKbStatus(status);
+        if (status.available_models) {
+          setEmbeddingModels(status.available_models);
+          const active = status.available_models.find((m) => m.is_active);
+          if (active) setEmbeddingModelId(active.id);
+        }
         if (status.status !== "ready") {
           timer = setTimeout(checkStatus, 3000);
         }
@@ -72,6 +82,17 @@ export default function Home() {
       textarea.style.height = `${textarea.scrollHeight}px`;
     }
   }, [inputValue]);
+
+  const handleSwitchEmbeddingModel = async (modelId: string) => {
+    try {
+      const status = await switchEmbeddingModel(modelId);
+      setKbStatus(status);
+      setEmbeddingModelId(modelId);
+      if (status.available_models) setEmbeddingModels(status.available_models);
+    } catch (e) {
+      console.error("切换嵌入模型失败", e);
+    }
+  };
 
   const handleScroll = useCallback(() => {
     const container = chatContainerRef.current;
@@ -156,10 +177,14 @@ export default function Home() {
           try {
             const status = await getKnowledgeBaseStatus();
             setKbStatus(status);
+            if (status.available_models) setEmbeddingModels(status.available_models);
           } catch (e) {
             console.error("刷新状态失败", e);
           }
         }}
+        embeddingModelId={embeddingModelId}
+        embeddingModels={embeddingModels}
+        onSwitchEmbeddingModel={handleSwitchEmbeddingModel}
       />
 
       <main className="relative flex flex-1 flex-col bg-card">

@@ -47,10 +47,23 @@ export interface ChatMessage {
   trace?: TraceData;
 }
 
+export interface EmbeddingModelInfo {
+  id: string;
+  name: string;
+  description: string;
+  dim: number;
+  is_built: boolean;
+  is_default: boolean;
+  is_active: boolean;
+}
+
 export interface KnowledgeBaseStatus {
   status: 'ready' | 'empty' | string;
   version: string;
   embedding_model?: string;
+  active_model_id?: string;
+  active_model_name?: string;
+  available_models?: EmbeddingModelInfo[];
 }
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
@@ -68,29 +81,15 @@ export function getKnowledgeBaseStatus() {
   return requestJson<KnowledgeBaseStatus>('/api/v1/knowledge_base/status');
 }
 
-export function buildKnowledgeBase(model: string) {
-  return requestJson<{ status: string; message: string; embedding_model?: string }>('/api/v1/knowledge_base/build', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model }),
-  });
+export function getEmbeddingModels() {
+  return requestJson<{ models: EmbeddingModelInfo[] }>('/api/v1/knowledge_base/models');
 }
 
-export function cleanKnowledgeBase() {
-  return requestJson<{ status: string; message: string }>('/api/v1/knowledge_base/clean', {
+export function switchEmbeddingModel(modelId: string) {
+  return requestJson<KnowledgeBaseStatus>('/api/v1/knowledge_base/switch_model', {
     method: 'POST',
-  });
-}
-
-export function syncKnowledgeBase(model?: string) {
-  return requestJson<{ status: string; message: string; embedding_model?: string }>('/api/v1/knowledge_base/sync', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model_id: modelId }),
   });
 }
 

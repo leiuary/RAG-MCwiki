@@ -1,5 +1,4 @@
 import json
-import asyncio
 import time
 import logging
 from typing import Optional
@@ -14,16 +13,13 @@ from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-class BuildRequest(BaseModel):
-    model: str = "shibing624/text2vec-base-chinese"
-
-class SyncRequest(BaseModel):
-    model: Optional[str] = None
-
 class ModelsRequest(BaseModel):
     provider: str
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+
+class SwitchModelRequest(BaseModel):
+    model_id: str
 
 router = APIRouter()
 _security = HTTPBearer(auto_error=False)
@@ -41,29 +37,6 @@ async def verify_bot_token(
 
 # ── Knowledge Base ──
 
-@router.post("/knowledge_base/build")
-async def build_kb(req: BuildRequest):
-    await asyncio.to_thread(kb_manager.rebuild, req.model)
-    return {
-        "status": "success",
-        "message": "知识库构建完成",
-        "embedding_model": kb_manager.embedding_model_name,
-    }
-
-@router.post("/knowledge_base/clean")
-async def clean_kb():
-    await asyncio.to_thread(kb_manager.clean)
-    return {"status": "success", "message": "知识库已清理"}
-
-@router.post("/knowledge_base/sync")
-async def sync_kb(req: SyncRequest):
-    await asyncio.to_thread(kb_manager.rebuild, req.model)
-    return {
-        "status": "success",
-        "message": "知识库同步完成",
-        "embedding_model": kb_manager.embedding_model_name,
-    }
-
 @router.get("/knowledge_base/status")
 async def kb_status():
     runtime_status = kb_manager.get_status()
@@ -71,7 +44,23 @@ async def kb_status():
         "status": "ready" if runtime_status["ready"] else "empty",
         "version": runtime_status["version"],
         "embedding_model": runtime_status["embedding_model"],
+        "active_model_id": runtime_status["active_model_id"],
+        "active_model_name": runtime_status["active_model_name"],
+        "available_models": runtime_status["available_models"],
     }
+
+@router.get("/knowledge_base/models")
+async def kb_models():
+    return {"models": kb_manager.get_status()["available_models"]}
+
+@router.post("/knowledge_base/switch_model")
+async def kb_switch_model(req: SwitchModelRequest):
+    try:
+        return kb_manager.switch_model(req.model_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ── Models ──
 
@@ -115,6 +104,8 @@ async def chat(request: ChatRequest):
             search_terms = result["search_terms"]
             llm_config = result["llm_config"]
             system_prompt = result["system_prompt"]
+            retrieve_time_ms = result.get("retrieve_time_ms", 0)
+            step_durations["检索"] = round(retrieve_time_ms, 2)
             step_durations["链与Prompt构建"] = round((time.time() - chain_build_start) * 1000, 2)
 
             # trace_config
@@ -122,11 +113,6 @@ async def chat(request: ChatRequest):
 
             # processing
             yield f"data: {json.dumps({'type': 'trace', 'data': {'status': 'processing', 'model_choice': request.model_choice, 'answer_detail': request.answer_detail}})}\n\n"
-
-            # trace (retrieval already done by chat())
-            retrieve_time = round(step_durations.get("检索", 0), 2)
-            # Re-measure retrieval time: rag_engine.chat already did retrieval, but we can approximate
-            step_durations["检索"] = round((time.time() - chain_build_start - step_durations["链与Prompt构建"]) * 1000, 2)
             if docs:
                 first_context_ms = round((time.time() - start_time) * 1000, 2)
 

@@ -11,3 +11,12 @@ langchain-classic>=0.0.1
 chromadb>=0.4.24
 sentence-transformers>=2.5.1
 requests>=2.31.0
+
+# ── 可选：ONNX 嵌入后端 (gte-quant) ──
+# pip install onnxruntime
+# onnxruntime>=1.18.0
+
+# ── 可选：GGUF 嵌入后端 (qwen3-gguf) ──
+# pip install llama-cpp-python huggingface-hub
+# llama-cpp-python>=0.2.80
+# huggingface-hub>=0.24.0

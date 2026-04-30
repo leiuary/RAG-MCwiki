@@ -98,15 +98,37 @@ class MediaWikiTextExtractor(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_dict = dict(attrs)
         classes = set((attrs_dict.get("class") or "").split())
+        style = (attrs_dict.get("style") or "").lower().replace(" ", "")
+        
+        # 识别 display:none 或 aria-hidden，过滤隐藏的 [[|]]
         should_drop = (
             tag in self.DROP_TAGS
             or bool(classes & self.DROP_CLASSES)
             or attrs_dict.get("aria-hidden") == "true"
+            or "display:none" in style
         )
         self._drop_stack.append(should_drop)
 
         if self._is_dropping():
             return
+
+        # 优化：从图片或链接属性中提取“悬浮名称”
+        if tag in ("a", "img", "span"):
+            # 优先顺序：alt > title
+            val = attrs_dict.get("alt") or attrs_dict.get("title")
+            if val and len(val) < 100: # 过滤掉超长说明
+                # 针对 Wiki 常见的 "描述：XXX" 或 "链接到XXX" 进行清洗
+                if "：" in val:
+                    val = val.split("：")[-1]
+                elif ":" in val:
+                    val = val.split(":")[-1]
+                
+                # 排除占位符和重复项
+                val = val.strip()
+                if val and val not in ("[[|]]", "") and not val.startswith("Invicon"):
+                    # 只有当该名称不在最近提取的部分中时才添加，减少重复
+                    if not self._parts or val not in self._parts[-1]:
+                        self._parts.append(f" {val} ")
 
         if tag in self.BLOCK_TAGS:
             self._append_newline()

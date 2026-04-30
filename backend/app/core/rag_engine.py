@@ -1,7 +1,9 @@
 import hashlib
 import logging
 import asyncio
+import time
 import ipaddress
+import jieba
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 
@@ -57,6 +59,26 @@ def _validate_llm_url(url: str, provider: str) -> None:
             raise ValueError(f"不允许访问内网地址: {host}")
 
 
+# 标题中包含以下模式 → 细节页（快照/预发布/RC/子页面），不包含 → 概述页
+_DETAIL_TITLE_PATTERNS = [
+    re.compile(r'-snapshot-\d+', re.IGNORECASE),
+    re.compile(r'-pre-\d+', re.IGNORECASE),
+    re.compile(r'-rc-\d+', re.IGNORECASE),
+    re.compile(r'/'),
+    re.compile(r'测试版本'),
+    re.compile(r'开发版本'),
+]
+
+_OVERVIEW_BOOST = 3
+
+
+def _is_overview_page(title: str) -> bool:
+    for pat in _DETAIL_TITLE_PATTERNS:
+        if pat.search(title):
+            return False
+    return True
+
+
 class RAGEngine:
     """对话检索引擎，依赖外部注入的 KnowledgeBaseManager 提供向量库。"""
 
@@ -75,7 +97,7 @@ class RAGEngine:
         """Query 改写：将用户口语转化为精准的搜索短语。"""
         prompt = (
             "你是一个Minecraft搜索专家。请将用户的提问改写为3个用于知识库检索的短语。\n"
-            "要求：1. 包含核心实体；2. 使用维基风格术语；3. 只输出短语，每行一个。\n\n"
+            "要求：1. 包含核心实体；2. 使用Minecraft中真实存在的维基术语，不要编造游戏内不存在的概念；3. 只输出短语，每行一个。\n\n"
             f"用户问题：{query}"
         )
         try:
@@ -91,12 +113,13 @@ class RAGEngine:
             return [query]
 
     async def retrieve(self, query: str, llm=None) -> tuple[List[Document], List[str]]:
-        """整合改写后的多路向量检索。"""
+        """整合改写后的多路向量检索 + 关键词索引召回。"""
         search_terms = [query]
         if llm:
             transformed = await self._transform_query(query, llm)
             search_terms.extend(transformed)
 
+        # ── 向量检索 ──
         all_docs = []
         with self.kb._lock:
             current_retriever = self.retriever
@@ -106,7 +129,18 @@ class RAGEngine:
             for term in set(search_terms):
                 all_docs.extend(current_retriever.invoke(term))
 
-        # 语义去重
+        # ── 关键词索引召回：查询词命中标题时直接注入对应 chunk ──
+        tokens = [t for t in jieba.cut(query) if len(t) > 1]
+        if tokens and self.kb:
+            for token in tokens:
+                entries = self.kb.lookup_by_keyword(token)
+                for entry in entries:
+                    all_docs.append(Document(
+                        page_content=entry["text"],
+                        metadata=entry["meta"],
+                    ))
+
+        # ── 语义去重 ──
         unique_docs = []
         seen_content = set()
         for doc in all_docs:
@@ -115,7 +149,28 @@ class RAGEngine:
                 unique_docs.append(doc)
                 seen_content.add(content_hash)
 
-        return unique_docs[:8], search_terms
+        # ── 关键词 + 概述页加成重排序 ──
+        if tokens:
+            def _keyword_score(doc):
+                title = doc.metadata.get("title", "")
+                content = doc.page_content
+                score = 0
+                for t in tokens:
+                    if t == title:
+                        score += 10   # 精确标题匹配最高权重
+                    elif t in title:
+                        score += 5    # 子串匹配
+                    elif t in content:
+                        score += 1    # 内容匹配兜底
+                if _is_overview_page(title):
+                    score += _OVERVIEW_BOOST
+                return score
+
+            scored = [(d, _keyword_score(d), i) for i, d in enumerate(unique_docs)]
+            scored.sort(key=lambda x: (-x[1], x[2]))
+            unique_docs = [d for d, _, _ in scored]
+
+        return unique_docs[:15], search_terms
 
     # ── 会话管理 ──
 
@@ -161,7 +216,9 @@ class RAGEngine:
         )
         system_prompt = self.build_system_prompt(answer_detail)
 
+        retrieve_start = time.time()
         docs, search_terms = await self.retrieve(message, llm=llm)
+        retrieve_time_ms = (time.time() - retrieve_start) * 1000
 
         include_history = session_id is not None
         qa_chain = self.get_qa_chain(llm, answer_detail, include_history=include_history)
@@ -179,6 +236,7 @@ class RAGEngine:
                 "search_terms": search_terms,
                 "llm_config": llm_config,
                 "system_prompt": system_prompt,
+                "retrieve_time_ms": retrieve_time_ms,
             }
 
         try:
@@ -259,7 +317,7 @@ class RAGEngine:
             "backend": backend,
             "base_url": url,
             "model": name,
-            "temperature": 1.0,
+            "temperature": 0.3,
             "streaming": streaming,
         }
 
@@ -267,7 +325,7 @@ class RAGEngine:
             base_url=url,
             api_key=key,
             model=name,
-            temperature=1.0,
+            temperature=0.3,
             streaming=streaming,
         ), config
 

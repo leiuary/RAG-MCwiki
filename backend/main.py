@@ -25,14 +25,15 @@ app.add_middleware(
 )
 
 async def initialize_rag_bg():
-    """后台初始化知识库和 RAG 引擎，避免阻塞服务器启动"""
-    logger.info("知识库正在后台进行初始化...")
+    """后台连接向量库（不构建），避免阻塞服务器启动"""
+    logger.info("RAG 引擎正在后台连接向量库...")
     try:
-        await asyncio.to_thread(kb_manager.initialize)
+        await asyncio.to_thread(kb_manager.connect)
         rag_engine.kb = kb_manager
-        logger.info("知识库后台初始化成功")
+        ready = kb_manager.retriever is not None
+        logger.info(f"RAG 引擎连接完毕，向量库状态: {'就绪' if ready else '未初始化'}")
     except Exception as e:
-        logger.error(f"知识库后台初始化失败: {str(e)}")
+        logger.error(f"RAG 引擎连接失败: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
