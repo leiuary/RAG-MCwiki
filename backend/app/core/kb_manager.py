@@ -197,24 +197,29 @@ class KnowledgeBaseManager:
     # ── 关键词索引（辅助向量检索，零额外依赖） ──
 
     def _build_indices(self):
-        """构建标题→chunks 内存索引（仅标题，极快）。"""
+        """构建标题→chunks 内存索引（分页加载，避免 OOM）。"""
         self._title_index.clear()
+        batch_size = 2000
+        offset = 0
         try:
-            all_data = self.vectorstore.get()
-        except Exception:
-            logger.warning("无法从向量库加载全部数据，跳过标题索引构建")
-            return
-        metas = all_data.get("metadatas", [])
-        docs = all_data.get("documents", [])
-        for meta, doc in zip(metas, docs):
-            title = meta.get("title", "")
-            if title:
-                self._title_index.setdefault(title, []).append(
-                    {"text": doc, "meta": meta}
-                )
+            while True:
+                all_data = self.vectorstore.get(limit=batch_size, offset=offset)
+                metas = all_data.get("metadatas", [])
+                docs = all_data.get("documents", [])
+                if not metas:
+                    break
+                for meta, doc in zip(metas, docs):
+                    title = meta.get("title", "")
+                    if title:
+                        self._title_index.setdefault(title, []).append(
+                            {"text": doc, "meta": meta}
+                        )
+                offset += batch_size
+        except Exception as e:
+            logger.warning(f"标题索引构建出错: {e}")
         logger.info(f"标题索引构建完成: {len(self._title_index)} 个页面")
 
-    def lookup_by_keyword(self, token: str, max_titles: int = 80) -> List[dict]:
+    def lookup_by_keyword(self, token: str, max_titles: int = 80, max_chunks_per_title: int = 5, max_results: int = 200) -> List[dict]:
         """返回标题（优先）或内容中包含 token 的 chunk 列表。泛词返回空。"""
         results = []
         seen_titles = set()
@@ -224,7 +229,9 @@ class KnowledgeBaseManager:
                 seen_titles.add(title)
                 if len(seen_titles) > max_titles:
                     return []
-                results.extend(chunks)
+                results.extend(chunks[:max_chunks_per_title])
+                if len(results) >= max_results:
+                    return results[:max_results]
         # 第二遍：标题没命中时，搜索内容（仅 token 不泛时触发）
         if not results:
             for title, chunks in self._title_index.items():
@@ -234,6 +241,8 @@ class KnowledgeBaseManager:
                         if len(seen_titles) > max_titles:
                             return []
                         results.append(chunk)
+                        if len(results) >= max_results:
+                            return results[:max_results]
         return results
 
     # ── 内部方法 ──

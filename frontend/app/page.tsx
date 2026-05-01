@@ -30,10 +30,18 @@ function loadMessages(): ChatMessage[] {
 }
 
 export default function Home() {
-  const [messages, setMessages] = useState<ChatMessage[]>(loadMessages);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [initialized, setInitialized] = useState(false);
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [kbStatus, setKbStatus] = useState<KnowledgeBaseStatus | null>(null);
+
+  useEffect(() => {
+    if (!initialized) {
+      setMessages(loadMessages());
+      setInitialized(true);
+    }
+  }, [initialized]);
 
   const [modelChoice, setModelChoice] = useState("api");
   const [baseUrl, setBaseUrl] = useState("");

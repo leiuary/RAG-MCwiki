@@ -18,10 +18,19 @@ class HuggingFaceEmbeddingBackend:
             model_name=preset.model_name_or_path,
             encode_kwargs={"normalize_embeddings": True, "batch_size": 2},
         )
+        try:
+            import torch
+            self._device = "CUDA" if torch.cuda.is_available() else "CPU"
+        except ImportError:
+            self._device = "CPU"
 
     @property
     def model_id(self) -> str:
         return self._model_id
+
+    @property
+    def device(self) -> str:
+        return self._device
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         result = self._hf.embed_documents(texts)
@@ -54,6 +63,7 @@ class ONNXEmbeddingBackend:
         available = ort.get_available_providers()
         preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
         providers = [p for p in preferred if p in available]
+        self._device = providers[0].replace("ExecutionProvider", "") if providers else "CPU"
         logger.info(f"ONNX Runtime providers: {available} → 选用 {providers}")
 
         sess_opts = ort.SessionOptions()
@@ -65,6 +75,10 @@ class ONNXEmbeddingBackend:
     @property
     def model_id(self) -> str:
         return self._model_id
+
+    @property
+    def device(self) -> str:
+        return self._device
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
         import numpy as np
@@ -137,10 +151,19 @@ class GGUFEmbeddingBackend:
             n_gpu_layers=-1,  # -1 = 全部 offload 到 GPU，0 = 纯 CPU
             verbose=False,
         )
+        try:
+            import torch
+            self._device = "CUDA" if torch.cuda.is_available() else "CPU"
+        except ImportError:
+            self._device = "CPU"
 
     @property
     def model_id(self) -> str:
         return self._model_id
+
+    @property
+    def device(self) -> str:
+        return self._device
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         results = []

@@ -31,6 +31,8 @@ export interface TraceData {
   first_context_ms?: number;
   system_prompt?: string;
   llm_config?: LLMConfig;
+  embedding_model?: string;
+  embedding_device?: string;
   step_durations_ms?: StepDurations;
   execution_mode?: string;
   fallback_used?: boolean;
@@ -38,6 +40,10 @@ export interface TraceData {
   ttft_ms?: number;
   total_time_ms?: number;
   output_chars?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  token_estimated?: boolean;
 }
 
 export interface ChatMessage {
@@ -125,7 +131,12 @@ export async function* streamChat(
   });
 
   if (!response.ok) {
-    throw new Error('网络请求失败');
+    const body = await response.text().catch(() => '');
+    throw new Error(
+      response.status === 503
+        ? '服务正在初始化，请稍后重试'
+        : body || `请求失败 (${response.status})`
+    );
   }
 
   const reader = response.body?.getReader();

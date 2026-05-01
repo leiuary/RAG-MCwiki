@@ -2,12 +2,14 @@ import hashlib
 import logging
 import asyncio
 import time
+import re
 import ipaddress
 import jieba
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 
 from langchain_core.documents import Document
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -69,7 +71,7 @@ _DETAIL_TITLE_PATTERNS = [
     re.compile(r'开发版本'),
 ]
 
-_OVERVIEW_BOOST = 3
+_OVERVIEW_BOOST = 6
 
 
 def _is_overview_page(title: str) -> bool:
@@ -77,6 +79,35 @@ def _is_overview_page(title: str) -> bool:
         if pat.search(title):
             return False
     return True
+
+
+class _TokenCounter(BaseCallbackHandler):
+    """抓取 LLM 调用结束时的 token 用量。"""
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        try:
+            usage = None
+            # DeepSeek / OpenAI 格式的 usage 在不同 LangChain 版本中位置不同
+            if hasattr(response, 'llm_output') and response.llm_output:
+                usage = response.llm_output.get('token_usage')
+            if not usage:
+                generations = getattr(response, 'generations', [])
+                for gen_list in generations:
+                    for g in gen_list:
+                        msg = getattr(g, 'message', None)
+                        if msg and hasattr(msg, 'usage_metadata'):
+                            usage = msg.usage_metadata
+                            break
+            if usage:
+                self.prompt_tokens = usage.get('prompt_tokens', 0) or 0
+                self.completion_tokens = usage.get('completion_tokens', 0) or 0
+                self.total_tokens = usage.get('total_tokens', 0) or 0
+        except Exception:
+            pass
 
 
 class RAGEngine:
@@ -94,45 +125,73 @@ class RAGEngine:
     # ── 检索 ──
 
     async def _transform_query(self, query: str, llm) -> List[str]:
-        """Query 改写：将用户口语转化为精准的搜索短语。"""
+        """Query 改写：版本号走规则（零延迟），其余走 LLM。"""
+        # ── 规则扩展：版本号 → 跳过 LLM，直接返回确定好用的搜索词 ──
+        ver_match = re.search(r'(\d+\.\d+(?:\.\d+)?)', query)
+        if ver_match:
+            v = ver_match.group(1)
+            terms = [v, f"Java版{v}"]
+            if "基岩" in query or "携带" in query or "bedrock" in query.lower():
+                terms.append(f"基岩版{v}")
+            if query not in terms:
+                terms.append(query)
+            return terms[:4]
+
+        # ── LLM 改写 ──
         prompt = (
-            "你是一个Minecraft搜索专家。请将用户的提问改写为3个用于知识库检索的短语。\n"
-            "要求：1. 包含核心实体；2. 使用Minecraft中真实存在的维基术语，不要编造游戏内不存在的概念；3. 只输出短语，每行一个。\n\n"
+            "你是Minecraft Wiki搜索专家。将以下问题改写为3个不同的搜索短语，每个短语一行。\n"
+            "策略指南：\n"
+            "- 提取问题中的核心游戏实体（物品、方块、生物、结构等）作为独立搜索词\n"
+            "- 使用Minecraft Wiki上真实存在的条目名称，不要编造\n"
+            "- 如果问题涉及游戏机制（如生成、繁殖、合成、更新），将机制名称作为一个短语\n"
+            "- 每条短语应当与其它两条有显著差异，不要重复\n\n"
             f"用户问题：{query}"
         )
         try:
-            response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=10.0)
+            response = await asyncio.wait_for(llm.ainvoke(prompt), timeout=5.0)
             lines = response.content.strip().split("\n")
-            transformed = [l.strip("- ").strip() for l in lines if l.strip()]
-            return transformed[:3]
-        except asyncio.TimeoutError:
-            logger.warning("Query 改写超时，使用原句检索")
-            return [query]
-        except Exception as e:
-            logger.error(f"Query 改写失败: {e}")
+            llm_terms = [l.strip("- ").strip() for l in lines if l.strip()]
+            llm_terms.insert(0, query)
+            return list(dict.fromkeys(llm_terms))[:4]
+        except (asyncio.TimeoutError, Exception) as e:
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning("Query 改写超时")
+            else:
+                logger.error(f"Query 改写失败: {e}")
             return [query]
 
     async def retrieve(self, query: str, llm=None) -> tuple[List[Document], List[str]]:
         """整合改写后的多路向量检索 + 关键词索引召回。"""
-        search_terms = [query]
         if llm:
-            transformed = await self._transform_query(query, llm)
-            search_terms.extend(transformed)
+            search_terms = await self._transform_query(query, llm)
+        if not search_terms:
+            search_terms = [query]
 
-        # ── 向量检索 ──
+        # ── 向量检索（并行） ──
         all_docs = []
         with self.kb._lock:
             current_retriever = self.retriever
             if not current_retriever:
                 return [], search_terms
 
-            for term in set(search_terms):
-                all_docs.extend(current_retriever.invoke(term))
+        async def _invoke(term):
+            return await asyncio.to_thread(current_retriever.invoke, term)
 
-        # ── 关键词索引召回：查询词命中标题时直接注入对应 chunk ──
-        tokens = [t for t in jieba.cut(query) if len(t) > 1]
-        if tokens and self.kb:
-            for token in tokens:
+        tasks = [_invoke(term) for term in set(search_terms)]
+        results = await asyncio.gather(*tasks)
+        for docs in results:
+            all_docs.extend(docs)
+
+        # ── 关键词索引召回：jieba 分词 + 完整搜索词双重匹配 ──
+        all_tokens: set = set()
+        for term in set(search_terms):
+            all_tokens.add(term)  # 完整搜索词，不被 jieba 截断（如 "Java版26.1"）
+            for t in jieba.cut(term):
+                if len(t) > 1:
+                    all_tokens.add(t)
+
+        if all_tokens and self.kb:
+            for token in all_tokens:
                 entries = self.kb.lookup_by_keyword(token)
                 for entry in entries:
                     all_docs.append(Document(
@@ -150,12 +209,12 @@ class RAGEngine:
                 seen_content.add(content_hash)
 
         # ── 关键词 + 概述页加成重排序 ──
-        if tokens:
+        if all_tokens:
             def _keyword_score(doc):
                 title = doc.metadata.get("title", "")
                 content = doc.page_content
                 score = 0
-                for t in tokens:
+                for t in all_tokens:
                     if t == title:
                         score += 10   # 精确标题匹配最高权重
                     elif t in title:
@@ -169,6 +228,17 @@ class RAGEngine:
             scored = [(d, _keyword_score(d), i) for i, d in enumerate(unique_docs)]
             scored.sort(key=lambda x: (-x[1], x[2]))
             unique_docs = [d for d, _, _ in scored]
+
+        # ── 跨文档多样性：每个标题最多 3 条 ──
+        PER_TITLE_CAP = 3
+        title_counts = {}
+        diverse_docs = []
+        for doc in unique_docs:
+            t = doc.metadata.get("title", "__unknown__")
+            if title_counts.get(t, 0) < PER_TITLE_CAP:
+                diverse_docs.append(doc)
+                title_counts[t] = title_counts.get(t, 0) + 1
+        unique_docs = diverse_docs
 
         return unique_docs[:15], search_terms
 
@@ -222,6 +292,7 @@ class RAGEngine:
 
         include_history = session_id is not None
         qa_chain = self.get_qa_chain(llm, answer_detail, include_history=include_history)
+        token_counter = _TokenCounter()
 
         chain_input: dict = {"input": message, "context": docs}
         if include_history:
@@ -237,6 +308,7 @@ class RAGEngine:
                 "llm_config": llm_config,
                 "system_prompt": system_prompt,
                 "retrieve_time_ms": retrieve_time_ms,
+                "token_counter": token_counter,
             }
 
         try:
@@ -321,24 +393,38 @@ class RAGEngine:
             "streaming": streaming,
         }
 
+        model_kwargs = {}
+        if model_choice == "api":
+            model_kwargs["stream_options"] = {"include_usage": True}
+
         return ChatOpenAI(
             base_url=url,
             api_key=key,
             model=name,
             temperature=0.3,
             streaming=streaming,
+            model_kwargs=model_kwargs,
         ), config
 
     @staticmethod
     def build_system_prompt(answer_detail="标准"):
         detail_reqs = {
             "简洁": "回答控制在3到5句，聚焦关键结论。",
-            "标准": "先给结论，再给步骤，步骤不少于5条，并补充1到2条注意事项。",
-            "详细": "按「结论 → 具体步骤 → 材料清单 → 常见错误 → 进阶优化」输出，步骤不少于8条。",
+            "标准": "先给结论，再展开解释。涉及操作流程时给出步骤（不少于5条），并补充注意事项。",
+            "详细": (
+                "先给出准确结论，再展开详细解释。\n"
+                "请根据问题类型灵活选择回答结构：\n"
+                "- 如果问题涉及操作流程或合成配方：给出步骤和材料\n"
+                "- 如果问题是事实查询：直接列出数据和要点\n"
+                "- 如果涉及多个变体或版本：用表格或列表对比\n"
+                "- 内容充分展开，确保覆盖所有相关细节\n"
+                "- 不要套用固定的章节模板，让内容决定结构"
+            ),
         }
         return (
-            "你是一个Minecraft知识库智能助手。请使用以下检索到的背景信息来回答问题。\n"
-            "如果你不知道答案，就说你不知道，不要编造。\n"
+            "你是一个Minecraft知识库智能助手。优先使用以下检索到的背景信息回答问题。\n"
+            "如果背景信息不足以回答，可以结合你的知识补充，但必须明确标注「以下为推测内容，可能不准确」。\n"
+            "重要约定：游戏默认指Java版，除非明确说了基岩版。\n"
             f"回答详细度要求：{detail_reqs.get(answer_detail, detail_reqs['标准'])}\n\n"
             "背景信息：\n{context}"
         )

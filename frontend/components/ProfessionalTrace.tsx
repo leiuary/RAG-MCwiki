@@ -33,6 +33,9 @@ export default function ProfessionalTrace({ trace, sources }: Props) {
         <Metric label="检索片段" value={trace.retrieved_chunk_count ?? 0} />
         <Metric label="上下文" value={`${((trace.context_total_chars || 0) / 1000).toFixed(1)}k 字`} />
         <Metric label="输出" value={`${trace.output_chars || 0} 字`} />
+        <Metric label="输入 Token" value={`${trace.token_estimated ? "~" : ""}${trace.prompt_tokens || 0}`} />
+        <Metric label="输出 Token" value={`${trace.token_estimated ? "~" : ""}${trace.completion_tokens || 0}`} />
+        <Metric label="总 Token" value={`${trace.token_estimated ? "~" : ""}${trace.total_tokens || 0}`} />
         <Metric label="模式" value={trace.execution_mode || "stream"} mono />
       </div>
 
@@ -151,7 +154,7 @@ export default function ProfessionalTrace({ trace, sources }: Props) {
         </Card>
       )}
 
-      {/* LLM config */}
+      {/* LLM + Embedding config */}
       {trace.llm_config && (
         <Card>
           <CardHeader className="pb-3">
@@ -167,6 +170,22 @@ export default function ProfessionalTrace({ trace, sources }: Props) {
                   </span>
                 </div>
               ))}
+              {trace.embedding_model && (
+                <div className="flex items-center justify-between border-b border-border py-1">
+                  <span className="text-[11px] text-muted-foreground">embed_model</span>
+                  <span className="text-xs font-medium text-foreground font-mono max-w-[140px] truncate">
+                    {trace.embedding_model}
+                  </span>
+                </div>
+              )}
+              {trace.embedding_device && (
+                <div className="flex items-center justify-between border-b border-border py-1">
+                  <span className="text-[11px] text-muted-foreground">embed_device</span>
+                  <span className="text-xs font-medium text-foreground font-mono max-w-[140px] truncate">
+                    {trace.embedding_device}
+                  </span>
+                </div>
+              )}
             </div>
             {trace.fallback_used && (
               <div className="mt-3 rounded bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-200">

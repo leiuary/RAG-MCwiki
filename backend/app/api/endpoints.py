@@ -105,11 +105,21 @@ async def chat(request: ChatRequest):
             llm_config = result["llm_config"]
             system_prompt = result["system_prompt"]
             retrieve_time_ms = result.get("retrieve_time_ms", 0)
+            token_counter = result.get("token_counter")
             step_durations["检索"] = round(retrieve_time_ms, 2)
             step_durations["链与Prompt构建"] = round((time.time() - chain_build_start) * 1000, 2)
 
-            # trace_config
-            yield f"data: {json.dumps({'type': 'trace_config', 'data': {'system_prompt': system_prompt, 'llm_config': llm_config}})}\n\n"
+            # trace_config — 加上 embedding 模型信息
+            emb_status = rag_engine.kb.get_status() if rag_engine.kb else {}
+            emb_device = "unknown"
+            if rag_engine.kb and rag_engine.kb.embeddings and hasattr(rag_engine.kb.embeddings, "device"):
+                emb_device = rag_engine.kb.embeddings.device
+            yield f"data: {json.dumps({'type': 'trace_config', 'data': {
+                'system_prompt': system_prompt,
+                'llm_config': llm_config,
+                'embedding_model': emb_status.get('embedding_model', ''),
+                'embedding_device': emb_device,
+            }})}\n\n"
 
             # processing
             yield f"data: {json.dumps({'type': 'trace', 'data': {'status': 'processing', 'model_choice': request.model_choice, 'answer_detail': request.answer_detail}})}\n\n"
@@ -145,7 +155,8 @@ async def chat(request: ChatRequest):
             llm_call_start = time.time()
 
             try:
-                async for chunk in qa_chain.astream(chain_input):
+                stream_config = {"callbacks": [token_counter]} if token_counter else None
+                async for chunk in qa_chain.astream(chain_input, config=stream_config):
                     if first_token_time is None:
                         first_token_time = time.time()
                     if chunk:
@@ -172,10 +183,33 @@ async def chat(request: ChatRequest):
                     raise invoke_error
                 step_durations["LLM兜底调用"] = round((time.time() - fallback_start) * 1000, 2)
 
-            # perf trace
+            # perf trace — token 优先用 API 返回值，没有则估算
             total_time = (time.time() - start_time) * 1000
             ttft = (first_token_time - start_time) * 1000 if first_token_time else 0
-            yield f"data: {json.dumps({'type': 'trace_perf', 'data': {'ttft_ms': round(ttft, 2), 'total_time_ms': round(total_time, 2), 'output_chars': total_chars, 'step_durations_ms': step_durations, 'execution_mode': execution_mode, 'fallback_used': fallback_used, 'fallback_reason': fallback_reason}})}\n\n"
+            if token_counter and token_counter.total_tokens > 0:
+                prompt_tokens = token_counter.prompt_tokens
+                completion_tokens = token_counter.completion_tokens
+                total_tokens = token_counter.total_tokens
+                token_estimated = False
+            else:
+                prompt_chars = len(system_prompt) + len(request.message) + context_total_chars
+                prompt_tokens = round(prompt_chars / 2.5)
+                completion_tokens = round(total_chars / 2.5)
+                total_tokens = prompt_tokens + completion_tokens
+                token_estimated = True
+            yield f"data: {json.dumps({'type': 'trace_perf', 'data': {
+                'ttft_ms': round(ttft, 2),
+                'total_time_ms': round(total_time, 2),
+                'output_chars': total_chars,
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens,
+                'total_tokens': total_tokens,
+                'token_estimated': token_estimated,
+                'step_durations_ms': step_durations,
+                'execution_mode': execution_mode,
+                'fallback_used': fallback_used,
+                'fallback_reason': fallback_reason,
+            }})}\n\n"
 
         except Exception as e:
             logger.error(f"推理流异常: {str(e)}")
