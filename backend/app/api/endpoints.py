@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import logging
@@ -12,6 +13,9 @@ from backend.app.core.kb_manager import kb_manager
 from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+STREAM_TIMEOUT_SECONDS = 120
+INVOKE_TIMEOUT_SECONDS = 60
 
 class ModelsRequest(BaseModel):
     provider: str
@@ -97,6 +101,7 @@ async def chat(request: ChatRequest):
                 answer_detail=request.answer_detail,
                 session_id=None,
                 streaming=True,
+                use_bm25=request.use_bm25,
             )
             qa_chain = result["qa_chain"]
             chain_input = result["chain_input"]
@@ -128,6 +133,7 @@ async def chat(request: ChatRequest):
 
             context_total_chars = sum(len(d.page_content) for d in docs)
 
+            effective_bm25 = request.use_bm25 if request.use_bm25 is not None else settings.BM25_ENABLED
             trace_data = {
                 "search_terms": search_terms,
                 "retrieved_chunk_count": len(docs),
@@ -135,6 +141,7 @@ async def chat(request: ChatRequest):
                 "context_total_chars": context_total_chars,
                 "first_context_ms": first_context_ms,
                 "step_durations_ms": step_durations,
+                "retrieval_mode": "bm25_rrf" if effective_bm25 else "keyword",
             }
             yield f"data: {json.dumps({'type': 'trace', 'data': trace_data})}\n\n"
 
@@ -146,6 +153,7 @@ async def chat(request: ChatRequest):
                     "source_url": d.metadata.get("source_url"),
                     "content_length": len(d.page_content),
                     "content_preview": d.page_content,
+                    "retrieval_source": d.metadata.get("retrieval_source", "vector"),
                 }
                 for d in docs
             ]
@@ -156,7 +164,11 @@ async def chat(request: ChatRequest):
 
             try:
                 stream_config = {"callbacks": [token_counter]} if token_counter else None
+                stream_start = time.time()
                 async for chunk in qa_chain.astream(chain_input, config=stream_config):
+                    if time.time() - stream_start > STREAM_TIMEOUT_SECONDS:
+                        logger.warning("流式调用超时，强制结束")
+                        break
                     if first_token_time is None:
                         first_token_time = time.time()
                     if chunk:
@@ -172,12 +184,17 @@ async def chat(request: ChatRequest):
 
                 fallback_start = time.time()
                 try:
-                    content = await qa_chain.ainvoke(chain_input)
+                    content = await asyncio.wait_for(
+                        qa_chain.ainvoke(chain_input), timeout=INVOKE_TIMEOUT_SECONDS
+                    )
                     content = content if isinstance(content, str) else str(content)
                     total_chars = len(content)
                     if first_token_time is None:
                         first_token_time = time.time()
                     yield f"data: {json.dumps({'type': 'content', 'data': content})}\n\n"
+                except asyncio.TimeoutError:
+                    logger.error("invoke 调用超时")
+                    yield f"data: {json.dumps({'type': 'content', 'data': '❌ LLM 调用超时，请稍后重试'})}\n\n"
                 except Exception as invoke_error:
                     logger.error(f"invoke 也失败: {invoke_error}")
                     raise invoke_error
@@ -227,16 +244,22 @@ async def chat_bot(request: BotChatRequest):
         raise HTTPException(status_code=503, detail="RAG Engine not initialized")
 
     try:
-        result = await rag_engine.chat(
-            message=request.message,
-            model_choice=request.model_choice,
-            api_key=request.api_key,
-            base_url=request.base_url,
-            model_name=request.model_name,
-            answer_detail=request.answer_detail,
-            session_id=request.session_id,
-            streaming=False,
+        result = await asyncio.wait_for(
+            rag_engine.chat(
+                message=request.message,
+                model_choice=request.model_choice,
+                api_key=request.api_key,
+                base_url=request.base_url,
+                model_name=request.model_name,
+                answer_detail=request.answer_detail,
+                session_id=request.session_id,
+                streaming=False,
+                use_bm25=request.use_bm25,
+            ),
+            timeout=INVOKE_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="LLM 调用超时")
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowUp, BookText, Share2, Save, Search, Database, Loader2, CheckCircle2 } from "lucide-react";
+import { ArrowUp, BookText, Share2, Save, Search, Database, Loader2, CheckCircle2, Square } from "lucide-react";
 import {
   ChatMessage,
   streamChat,
@@ -49,19 +49,44 @@ export default function Home() {
   const [modelName, setModelName] = useState("");
   const [answerDetail, setAnswerDetail] = useState("标准");
   const [professionalMode, setProfessionalMode] = useState(false);
+  const [useBm25, setUseBm25] = useState(true);
   const [embeddingModelId, setEmbeddingModelId] = useState("");
   const [embeddingModels, setEmbeddingModels] = useState<EmbeddingModelInfo[]>([]);
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isAutoScrolling = useRef(true);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const pendingContentRef = useRef<string>("");
+  const rafIdRef = useRef<number | null>(null);
+  const saveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
 
+  // Step 6: sessionStorage 防抖写入
   useEffect(() => {
-    sessionStorage.setItem("rag-chat-messages", JSON.stringify(messages));
+    messagesRef.current = messages;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      sessionStorage.setItem("rag-chat-messages", JSON.stringify(messagesRef.current));
+    }, 500);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, [messages]);
+
+  // beforeunload 兜底：关闭页面前确保保存
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      sessionStorage.setItem("rag-chat-messages", JSON.stringify(messagesRef.current));
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
 
   useEffect(() => {
     let timer: NodeJS.Timeout;
+    let retryCount = 0;
+    const MAX_RETRIES = 20;
     const checkStatus = async () => {
       try {
         const status = await getKnowledgeBaseStatus();
@@ -71,10 +96,16 @@ export default function Home() {
           const active = status.available_models.find((m) => m.is_active);
           if (active) setEmbeddingModelId(active.id);
         }
+        retryCount = 0;
         if (status.status !== "ready") {
           timer = setTimeout(checkStatus, 3000);
         }
       } catch (e) {
+        retryCount++;
+        if (retryCount >= MAX_RETRIES) {
+          console.error("知识库状态轮询超时，已停止");
+          return;
+        }
         console.error("获取状态失败", e);
         timer = setTimeout(checkStatus, 5000);
       }
@@ -116,6 +147,39 @@ export default function Home() {
     }
   }, [messages]);
 
+  // rAF cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
+    };
+  }, []);
+
+  const handleStop = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+  }, []);
+
+  const handleSave = useCallback(() => {
+    if (messages.length === 0) return;
+    const blob = new Blob([JSON.stringify(messages, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rag-chat-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [messages]);
+
+  const handleShare = useCallback(async () => {
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+    if (!lastAssistant) return;
+    try {
+      await navigator.clipboard.writeText(lastAssistant.content);
+    } catch {
+      console.error("复制到剪贴板失败");
+    }
+  }, [messages]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputValue.trim() || isLoading) return;
@@ -133,6 +197,10 @@ export default function Home() {
     };
     setMessages((prev) => [...prev, assistantMessage]);
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    pendingContentRef.current = "";
+
     try {
       let currentContent = "";
       for await (const chunk of streamChat(
@@ -141,14 +209,23 @@ export default function Home() {
         apiKey || undefined,
         answerDetail,
         baseUrl,
-        modelName
+        modelName,
+        controller.signal,
+        useBm25
       )) {
         if (chunk.type === "content") {
           currentContent += chunk.data;
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            return [...prev.slice(0, -1), { ...last, content: currentContent }];
-          });
+          pendingContentRef.current = currentContent;
+          if (rafIdRef.current === null) {
+            rafIdRef.current = requestAnimationFrame(() => {
+              rafIdRef.current = null;
+              const content = pendingContentRef.current;
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                return [...prev.slice(0, -1), { ...last, content }];
+              });
+            });
+          }
         } else if (chunk.type === "sources") {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
@@ -166,13 +243,37 @@ export default function Home() {
           });
         }
       }
+      // flush remaining content
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      if (pendingContentRef.current) {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          return [...prev.slice(0, -1), { ...last, content: pendingContentRef.current }];
+        });
+      }
     } catch (error) {
-      console.error("对话错误:", error);
-      setMessages((prev) => [
-        ...prev.slice(0, -1),
-        { role: "assistant", content: "抱歉，连接后端时出现错误，请检查网络或服务状态。" },
-      ]);
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      if (error instanceof DOMException && error.name === "AbortError") {
+        // 用户主动停止，保留已有内容
+      } else {
+        console.error("对话错误:", error);
+        const currentContent = pendingContentRef.current;
+        if (!currentContent) {
+          const errorMsg = error instanceof Error ? error.message : "连接后端时出现错误";
+          setMessages((prev) => [
+            ...prev.slice(0, -1),
+            { role: "assistant", content: `抱歉，${errorMsg}` },
+          ]);
+        }
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsLoading(false);
     }
   };
@@ -200,11 +301,11 @@ export default function Home() {
         <header className="z-10 flex h-16 shrink-0 items-center justify-between border-b border-border px-6">
           <span className="text-sm font-medium text-foreground">推理控制台</span>
           <div className="flex gap-3">
-            <Button variant="outline" size="sm">
+            <Button variant="outline" size="sm" onClick={handleSave}>
               <Save size={16} />
               保存
             </Button>
-            <Button variant="outline" size="sm">
+            <Button variant="outline" size="sm" onClick={handleShare}>
               <Share2 size={16} />
               分享
             </Button>
@@ -336,22 +437,38 @@ export default function Home() {
                                 参考文献
                               </div>
                               <div className="flex flex-wrap gap-2.5">
-                                {msg.sources.map((src, j) => (
-                                  <a
-                                    key={j}
-                                    href={src.source_url}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="rounded-md border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-                                  >
-                                    {src.title} · {src.section}
-                                    {src.content_length !== undefined && (
-                                      <span className="ml-1 text-[11px] text-muted-foreground/60">
-                                        ({src.content_length}字)
+                                {msg.sources.map((src, j) => {
+                                  const sourceColors: Record<string, string> = {
+                                    vector: "bg-blue-500/10 text-blue-500 border-blue-500/20",
+                                    bm25: "bg-green-500/10 text-green-500 border-green-500/20",
+                                    both: "bg-purple-500/10 text-purple-500 border-purple-500/20",
+                                  };
+                                  const sourceLabels: Record<string, string> = {
+                                    vector: "向量",
+                                    bm25: "BM25",
+                                    both: "混合",
+                                  };
+                                  const source = src.retrieval_source || "vector";
+                                  return (
+                                    <a
+                                      key={j}
+                                      href={src.source_url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="rounded-md border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                                    >
+                                      {src.title} · {src.section}
+                                      <span className={`ml-1 rounded px-1 py-0.5 text-[10px] font-medium border ${sourceColors[source] || sourceColors.vector}`}>
+                                        {sourceLabels[source] || "向量"}
                                       </span>
-                                    )}
-                                  </a>
-                                ))}
+                                      {src.content_length !== undefined && (
+                                        <span className="ml-1 text-[11px] text-muted-foreground/60">
+                                          ({src.content_length}字)
+                                        </span>
+                                      )}
+                                    </a>
+                                  );
+                                })}
                               </div>
                             </div>
                           )}
@@ -405,18 +522,29 @@ export default function Home() {
                 className="flex-1 resize-none self-center border-none bg-transparent py-0.5 text-[17px] leading-relaxed text-foreground placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:ring-offset-0"
                 style={{ maxHeight: "12rem", minHeight: "1.5rem", fieldSizing: "content" }}
               />
-              <button
-                type="submit"
-                title="发送"
-                disabled={isLoading || !inputValue.trim()}
-                className={`flex size-10 shrink-0 items-center justify-center rounded-xl transition-all ${
-                  inputValue.trim() && !isLoading
-                    ? "bg-foreground text-white"
-                    : "bg-muted text-muted-foreground"
-                }`}
-              >
-                {isLoading ? <Loader2 className="custom-spin" size={18} /> : <ArrowUp size={18} strokeWidth={2.5} />}
-              </button>
+              {isLoading ? (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  title="停止生成"
+                  className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-foreground text-white transition-all"
+                >
+                  <Square size={18} />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  title="发送"
+                  disabled={!inputValue.trim()}
+                  className={`flex size-10 shrink-0 items-center justify-center rounded-xl transition-all ${
+                    inputValue.trim()
+                      ? "bg-foreground text-white"
+                      : "bg-muted text-muted-foreground"
+                  }`}
+                >
+                  <ArrowUp size={18} strokeWidth={2.5} />
+                </button>
+              )}
             </div>
             <div className="mt-4 flex justify-center text-[11px] font-medium tracking-wider text-muted-foreground">
               由 RAG-MCWIKI 引擎驱动
@@ -438,7 +566,8 @@ export default function Home() {
         setAnswerDetail={setAnswerDetail}
         professionalMode={professionalMode}
         setProfessionalMode={setProfessionalMode}
-
+        useBm25={useBm25}
+        setUseBm25={setUseBm25}
       />
     </div>
   );

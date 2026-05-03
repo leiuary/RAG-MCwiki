@@ -17,6 +17,7 @@ import io
 import threading
 import logging
 import time
+import msvcrt
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
@@ -25,7 +26,7 @@ if _project_root not in sys.path:
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm
 from rich.progress import Progress, BarColumn, TextColumn
 from rich import box
 
@@ -72,6 +73,53 @@ PHASE_LABELS = {
     "load":  "加载知识文件",
     "embed": "向量化并写入",
 }
+
+
+def select_option(options: list[str], prompt: str = "  >") -> int:
+    """上下方向键选择选项，Enter 确认，Esc 取消返回 -1。"""
+    selected = 0
+    n = len(options)
+
+    def _render():
+        for i, opt in enumerate(options):
+            if i == selected:
+                console.print(f"  [reverse]{prompt} {opt}[/reverse]     ")
+            else:
+                console.print(f"    {opt}     ")
+
+    # 首次渲染
+    _render()
+
+    while True:
+        ch = msvcrt.getwch()
+        # 方向键前缀
+        if ch in ('\x00', '\xe0'):
+            ch2 = msvcrt.getwch()
+            if ch2 == 'H':      # Up
+                selected = (selected - 1) % n
+            elif ch2 == 'P':    # Down
+                selected = (selected + 1) % n
+            else:
+                continue
+        elif ch == '\r':        # Enter
+            # 清除选项行
+            for _ in range(n):
+                sys.stdout.write("\033[A\033[2K")
+            sys.stdout.flush()
+            return selected
+        elif ch == '\x1b':      # Esc
+            for _ in range(n):
+                sys.stdout.write("\033[A\033[2K")
+            sys.stdout.flush()
+            return -1
+        else:
+            continue
+
+        # 重绘
+        for _ in range(n):
+            sys.stdout.write("\033[A\033[2K")
+        sys.stdout.flush()
+        _render()
 
 
 # ── 视图 ──
@@ -124,8 +172,9 @@ def _run_rebuild(model_id: str, result: dict, progress_cb=None):
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     try:
         with contextlib.redirect_stderr(io.StringIO()):
-            kb_manager.rebuild(model_id, progress_cb=progress_cb)
+            stats = kb_manager.rebuild(model_id, progress_cb=progress_cb)
         result["ok"] = True
+        result["stats"] = stats
     except Exception as e:
         result["ok"] = False
         result["error"] = str(e)
@@ -140,7 +189,14 @@ def cmd_build(model_id: str = None, priority: str = "low"):
         model_id = DEFAULT_MODEL_ID
     preset = EMBEDDING_MODEL_MAP[model_id]
 
+    # 检测是首次建立还是更新
+    persist_dir = get_model_persist_dir(settings.PERSIST_DIR, model_id)
+    state_path = os.path.join(persist_dir, "build_state.json")
+    is_update = os.path.exists(state_path)
+    action = "更新" if is_update else "建立"
+
     console.print(BANNER)
+    console.print(f"  操作: [cyan]{action} Embedding 向量库[/]")
     console.print(f"  模型: [yellow]{preset.display_name}[/]")
     console.print(f"  后端: [dim]{preset.backend_type}[/]")
     console.print(f"  维度: [dim]{preset.dim}[/]")
@@ -149,36 +205,81 @@ def cmd_build(model_id: str = None, priority: str = "low"):
     set_process_priority(priority)
 
     result: dict = {"ok": False}
-    progress_state: dict = {"phase": "init", "current": 0, "total": 0}
+    progress_state: dict = {"phase": "init", "current": 0, "total": 0, "msg": ""}
 
-    def on_progress(phase: str, current: int, total: int):
-        progress_state.update(phase=phase, current=current, total=total)
+    def on_progress(phase: str, current: int, total: int, msg: str = "", final_msg: str = ""):
+        d = {"phase": phase, "current": current, "total": total}
+        if msg:
+            d["msg"] = msg
+        if final_msg:
+            d["final_msg"] = final_msg
+        progress_state.update(d)
 
     thread = threading.Thread(target=_run_rebuild, args=(model_id, result, on_progress))
+
+    def _fmt_eta(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        m, s = divmod(int(seconds), 60)
+        if m < 60:
+            return f"{m}m{s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[info]}[/]"),
         console=console,
         transient=True,
     ) as progress_bar:
-        task = progress_bar.add_task("[cyan]加载模型...[/]", total=1, completed=0)
+        task = progress_bar.add_task("[cyan]加载模型...[/]", total=1, completed=0, info="")
         thread.start()
 
         prev_phase = None
+        embed_start_time = None
+        embed_start_offset = 0
+        last_speed = 0.0
+
         while thread.is_alive():
             ps = dict(progress_state)
             phase = ps["phase"]
             current = ps["current"]
             total = ps["total"] if ps["total"] > 0 else 1
 
+            # 进入 embed 阶段时记录起始时间
+            if phase == "embed" and embed_start_time is None:
+                embed_start_time = time.time()
+                embed_start_offset = current
+
+            info = ""
+            if phase == "embed" and embed_start_time is not None:
+                elapsed = time.time() - embed_start_time
+                done = current - embed_start_offset
+                if elapsed > 0 and done > 0:
+                    speed = done / elapsed
+                    remaining = total - current
+                    eta = remaining / speed if speed > 0 else 0
+                    last_speed = speed
+                    info = f"{speed:.1f} chunks/s  ETA {_fmt_eta(eta)}"
+                elif last_speed > 0:
+                    info = f"{last_speed:.1f} chunks/s"
+                # 附加最终调整结果
+                final_msg = ps.get("final_msg", "")
+                if final_msg:
+                    info = f"{final_msg} | {info}" if info else final_msg
+            else:
+                msg = ps.get("msg", "")
+                if msg:
+                    info = msg
+
             if total > 1:
                 label = f"[cyan]{PHASE_LABELS.get(phase, phase)}[/] [dim]{current}/{total}[/]"
             else:
                 label = f"[cyan]{PHASE_LABELS.get(phase, phase)}[/]"
 
-            progress_bar.update(task, description=label, total=total, completed=current)
+            progress_bar.update(task, description=label, total=total, completed=current, info=info)
             prev_phase = phase
             time.sleep(0.1)
 
@@ -189,10 +290,119 @@ def cmd_build(model_id: str = None, priority: str = "low"):
         progress_bar.update(task, description="[green]✔ 完成[/]", completed=total, total=total)
 
     if result["ok"]:
-        console.print("  [bold green]✔ 构建完成[/]\n")
+        stats = result.get("stats", {})
+        console.print(f"  [bold green]✔ Embedding 向量库{action}完成[/]\n")
+
+        # 扫描结果
+        console.print(f"  [dim]扫描文件数:[/] {stats.get('files_scanned', '?')}")
+
+        # 变更统计（更新模式下显示）
+        if action == "更新":
+            console.print(f"\n  [cyan]变更统计:[/]")
+            chunks_added = stats.get('chunks_added', 0)
+            chunks_removed = stats.get('chunks_removed', 0)
+            if chunks_added > 0:
+                console.print(f"    [green]+ {chunks_added} 个新 chunks[/]")
+            if chunks_removed > 0:
+                console.print(f"    [red]- {chunks_removed} 个已删除 chunks[/]")
+
+        # 最终结果
+        console.print(f"\n  [cyan]最终结果:[/]")
+        console.print(f"    chunks 数: {stats.get('new_chunks', '?')}")
+        console.print()
         show_summary()
     else:
-        console.print(f"\n[bold red]✘ 构建失败:[/] {result.get('error', '未知错误')}")
+        console.print(f"\n[bold red]✘ {action}失败:[/] {result.get('error', '未知错误')}")
+
+
+def cmd_rebuild_bm25():
+    """构建/更新 BM25 索引（独立于 Embedding，直接从文件读取）"""
+    console.print(BANNER)
+    console.print("  [cyan]正在构建/更新 BM25 索引...[/]\n")
+
+    result: dict = {"ok": False, "stats": None}
+    progress_state: dict = {"phase": "init", "current": 0, "total": 0, "msg": ""}
+
+    def on_progress(phase: str, current: int, total: int, msg: str = "", final_msg: str = ""):
+        d = {"phase": phase, "current": current, "total": total}
+        if msg:
+            d["msg"] = msg
+        if final_msg:
+            d["final_msg"] = final_msg
+        progress_state.update(d)
+
+    def _run():
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                stats = kb_manager.rebuild_bm25(progress_cb=on_progress)
+            result["ok"] = True
+            result["stats"] = stats
+        except Exception as e:
+            result["ok"] = False
+            result["error"] = str(e)
+
+    thread = threading.Thread(target=_run)
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[info]}[/]"),
+        console=console,
+        transient=True,
+    ) as progress_bar:
+        task = progress_bar.add_task("[cyan]初始化...[/]", total=1, completed=0, info="")
+        thread.start()
+
+        while thread.is_alive():
+            ps = dict(progress_state)
+            phase = ps["phase"]
+            current = ps["current"]
+            total = ps["total"] if ps["total"] > 0 else 1
+            msg = ps.get("msg", "")
+
+            phase_labels = {
+                "init": "初始化",
+                "index": "索引文档",
+                "bm25": "构建 BM25",
+                "done": "完成",
+            }
+            label = f"[cyan]{phase_labels.get(phase, phase)}[/]"
+            if phase == "index" and total > 1:
+                label += f" [dim]{current}/{total}[/]"
+
+            progress_bar.update(task, description=label, total=total, completed=current, info=msg)
+            time.sleep(0.1)
+
+        thread.join()
+
+    if result["ok"]:
+        stats = result["stats"]
+        action = stats.get("action", "构建")
+        console.print(f"  [bold green]✔ BM25 索引{action}完成[/]\n")
+
+        # 扫描结果
+        console.print(f"  [dim]扫描文件数:[/] {stats['files_scanned']}")
+
+        # 变更统计（更新模式下显示）
+        if action == "更新":
+            console.print(f"\n  [cyan]变更统计:[/]")
+            if stats['pages_added'] > 0:
+                console.print(f"    [green]+ {stats['pages_added']} 个新页面[/]")
+            if stats['pages_removed'] > 0:
+                console.print(f"    [red]- {stats['pages_removed']} 个已删除页面[/]")
+            if stats['docs_added'] > 0:
+                console.print(f"    [green]+ {stats['docs_added']} 个新文档[/]")
+            if stats['docs_removed'] > 0:
+                console.print(f"    [red]- {stats['docs_removed']} 个已删除文档[/]")
+
+        # 最终结果
+        console.print(f"\n  [cyan]最终结果:[/]")
+        console.print(f"    页面数: {stats['pages']}")
+        console.print(f"    n-gram 数: {stats['ngrams']}")
+        console.print(f"    BM25 文档数: {stats['bm25_docs']}")
+    else:
+        console.print(f"\n[bold red]✘ 操作失败:[/] {result.get('error', '未知错误')}")
 
 
 # ── 子命令 ──
@@ -217,25 +427,33 @@ def cmd_clean(model_id: str = None):
 # ── 交互式 TUI ──
 
 def _pick_model() -> str:
-    """交互式选择模型预设"""
+    """交互式选择模型预设（方向键 + 回车）"""
     console.print()
     console.print(make_models_table())
     console.print()
 
-    model_ids = [p.id for p in EMBEDDING_MODEL_PRESETS]
-    choices = model_ids + [""]
+    presets = list(EMBEDDING_MODEL_PRESETS)
     default_id = kb_manager.get_status().get("active_model_id", DEFAULT_MODEL_ID)
+    # 把当前使用的模型排到第一项
+    presets.sort(key=lambda p: (0 if p.id == default_id else 1))
+    labels = [f"{p.id} — {p.display_name}" for p in presets]
 
-    choice = Prompt.ask(
-        "  选择模型 ID",
-        choices=choices,
-        default=default_id,
-        show_choices=False,
-    )
-    return choice.strip() or default_id
+    idx = select_option(labels, prompt="选择模型")
+    if idx < 0:
+        return default_id
+    return presets[idx].id
 
 
 def interactive_tui():
+    MENU = [
+        ("构建/更新 Embedding", "b"),
+        ("构建/更新 BM25", "m"),
+        ("清理", "c"),
+        ("卸载 (释放显存)", "u"),
+        ("刷新", "r"),
+        ("退出", "q"),
+    ]
+
     while True:
         console.clear()
         console.print(BANNER)
@@ -243,34 +461,41 @@ def interactive_tui():
         console.print()
         show_summary()
         console.print()
-        console.print("  [[bold]B[/]] 构建  [[bold]C[/]] 清理  [[bold]U[/]] 卸载(释放显存)  [[bold]R[/]] 刷新  [[bold]Q[/]] 退出")
-        console.print()
 
-        choice = Prompt.ask(
-            "  >", choices=["b", "c", "u", "r", "q", ""],
-            default="r", show_choices=False,
-        ).lower()
+        idx = select_option([label for label, _ in MENU], prompt=">")
+        action = MENU[idx][1] if idx >= 0 else "r"
 
-        if choice == "q":
+        if action == "q":
             console.print("  [dim]再见~[/]")
             break
-        elif choice == "b":
+        elif action == "b":
             model_id = _pick_model()
-            priority = Prompt.ask(
-                "  构建优先级", choices=["low", "high"], default="low", show_choices=True
-            )
+            console.print()
+            priority_idx = select_option(["low — 低优先级（后台运行）", "high — 高优先级"], prompt="优先级")
+            priority = "high" if priority_idx == 1 else "low"
             cmd_build(model_id, priority=priority)
-            Prompt.ask("  [[dim]按回车继续[/]]", default="", show_default=False, show_choices=False)
-        elif choice == "c":
+            console.print("\n  [dim]按任意键继续...[/]")
+            msvcrt.getwch()
+        elif action == "m":
+            cmd_rebuild_bm25()
+            console.print("\n  [dim]按任意键继续...[/]")
+            msvcrt.getwch()
+        elif action == "c":
             model_id = _pick_model()
-            if Confirm.ask(f"  [yellow]确认清理向量库 ({model_id})？[/]", default=False):
+            console.print()
+            confirm_idx = select_option(["取消", f"确认清理 ({model_id})"], prompt="选择")
+            if confirm_idx == 1:
                 cmd_clean(model_id)
-            Prompt.ask("  [[dim]按回车继续[/]]", default="", show_default=False, show_choices=False)
-        elif choice == "u":
-            if Confirm.ask("  [yellow]确认卸载当前 Embedding 模型并释放显存？[/]", default=True):
+            console.print("\n  [dim]按任意键继续...[/]")
+            msvcrt.getwch()
+        elif action == "u":
+            console.print()
+            confirm_idx = select_option(["取消", "确认卸载并释放显存"], prompt="选择")
+            if confirm_idx == 1:
                 kb_manager.unload_model()
                 console.print("  [bold green]✔ 模型已卸载，显存已释放[/]\n")
-            Prompt.ask("  [[dim]按回车继续[/]]", default="", show_default=False, show_choices=False)
+            console.print("\n  [dim]按任意键继续...[/]")
+            msvcrt.getwch()
         # "r" → loop again
 
 
@@ -286,7 +511,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="查看知识库状态")
-    build_parser = sub.add_parser("build", help="构建/重建向量库")
+    build_parser = sub.add_parser("build", help="构建/更新 Embedding 向量库")
     build_parser.add_argument(
         "--model-id", type=str, default=None,
         help=f"Embedding 模型预设 ID (可选: {', '.join(p.id for p in EMBEDDING_MODEL_PRESETS)})",
@@ -295,6 +520,7 @@ def main():
         "--priority", type=str, choices=("low", "high"), default="low",
         help="进程优先级: low=最低（默认，不影响日常使用）, high=最高（加快构建）",
     )
+    sub.add_parser("bm25", help="构建/更新 BM25 索引")
     sub.add_parser("clean", help="清理向量库")
     sub.add_parser("sync", help="同步向量库（等价于 build）")
 
@@ -306,6 +532,8 @@ def main():
         cmd_status()
     elif args.command in ("build", "sync"):
         cmd_build(model_id=getattr(args, "model_id", None), priority=getattr(args, "priority", "low"))
+    elif args.command == "bm25":
+        cmd_rebuild_bm25()
     elif args.command == "clean":
         cmd_clean()
 

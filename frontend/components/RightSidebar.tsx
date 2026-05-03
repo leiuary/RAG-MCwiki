@@ -21,6 +21,8 @@ interface RightSidebarProps {
   setAnswerDetail: (val: string) => void;
   professionalMode: boolean;
   setProfessionalMode: (val: boolean) => void;
+  useBm25: boolean;
+  setUseBm25: (val: boolean) => void;
 
   baseUrl: string;
   setBaseUrl: (val: string) => void;
@@ -37,6 +39,8 @@ export default function RightSidebar({
   setAnswerDetail,
   professionalMode,
   setProfessionalMode,
+  useBm25,
+  setUseBm25,
   baseUrl,
   setBaseUrl,
   apiKey,
@@ -283,6 +287,20 @@ export default function RightSidebar({
             <Switch
               checked={professionalMode}
               onCheckedChange={setProfessionalMode}
+            />
+          </div>
+
+          {/* BM25 混合检索 */}
+          <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <label className="text-sm font-medium">BM25 混合检索</label>
+              <p className="text-[11px] text-muted-foreground">
+                向量 + BM25 双路召回，RRF 融合排序
+              </p>
+            </div>
+            <Switch
+              checked={useBm25}
+              onCheckedChange={setUseBm25}
             />
           </div>
         </section>

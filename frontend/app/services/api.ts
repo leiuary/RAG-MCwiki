@@ -5,6 +5,7 @@ export interface Source {
   content: string;
   content_length?: number;
   content_preview?: string;
+  retrieval_source?: string; // "vector" | "bm25" | "both"
 }
 
 export interface StepDurations {
@@ -27,6 +28,7 @@ export interface TraceData {
   search_terms?: string[];
   retrieved_chunk_count?: number;
   retrieve_time_ms?: number;
+  retrieval_mode?: string;
   context_total_chars?: number;
   first_context_ms?: number;
   system_prompt?: string;
@@ -113,7 +115,9 @@ export async function* streamChat(
   api_key?: string,
   answer_detail: string = '标准',
   base_url?: string,
-  model_name?: string
+  model_name?: string,
+  signal?: AbortSignal,
+  use_bm25?: boolean
 ) {
   const response = await fetch(`${API_BASE_URL}/api/v1/chat`, {
     method: 'POST',
@@ -126,8 +130,10 @@ export async function* streamChat(
       api_key,
       answer_detail,
       base_url,
-      model_name
+      model_name,
+      use_bm25,
     }),
+    signal,
   });
 
   if (!response.ok) {

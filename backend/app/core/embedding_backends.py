@@ -8,19 +8,26 @@ logger = logging.getLogger(__name__)
 # ── HuggingFace 后端（原版 Qwen3 / text2vec 等） ──
 
 class HuggingFaceEmbeddingBackend:
-    def __init__(self, preset):
+    def __init__(self, preset, batch_size: int = 32):
         from langchain_huggingface import HuggingFaceEmbeddings
 
-        logger.info(f"加载 HuggingFace 嵌入模型: {preset.model_name_or_path}")
+        logger.info(f"加载 HuggingFace 嵌入模型: {preset.model_name_or_path} (batch_size={batch_size})")
         self._model_id = preset.id
         self._progress_cb = None       # 外部可设置，用于批次进度回调
         self._hf = HuggingFaceEmbeddings(
             model_name=preset.model_name_or_path,
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 2},
+            model_kwargs={"trust_remote_code": True},
+            encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
         )
+
         try:
             import torch
-            self._device = "CUDA" if torch.cuda.is_available() else "CPU"
+            if torch.cuda.is_available():
+                self._device = "CUDA"
+                self._hf._client.half()
+                logger.info("已启用 fp16 半精度推理，显存占用减半")
+            else:
+                self._device = "CPU"
         except ImportError:
             self._device = "CPU"
 
@@ -71,6 +78,7 @@ class ONNXEmbeddingBackend:
         self._session = ort.InferenceSession(onnx_path, sess_opts, providers=providers)
         self._tokenizer = AutoTokenizer.from_pretrained(preset.model_name_or_path)
         self._dim = preset.dim
+        self._model_input_names = {i.name for i in self._session.get_inputs()}
 
     @property
     def model_id(self) -> str:
@@ -98,8 +106,7 @@ class ONNXEmbeddingBackend:
             }
             if "token_type_ids" in inputs:
                 ort_inputs["token_type_ids"] = inputs["token_type_ids"]
-            model_input_names = [i.name for i in self._session.get_inputs()]
-            ort_inputs = {k: v for k, v in ort_inputs.items() if k in model_input_names}
+            ort_inputs = {k: v for k, v in ort_inputs.items() if k in self._model_input_names}
 
             outputs = self._session.run(None, ort_inputs)
             token_embeddings = outputs[0]
@@ -166,13 +173,22 @@ class GGUFEmbeddingBackend:
         return self._device
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        batch_size = 64
         results = []
         total = len(texts)
-        for i, text in enumerate(texts):
-            resp = self._llm.create_embedding(text)
-            results.append(resp["data"][0]["embedding"])
-            if self._progress_cb and i % 10 == 0:
-                self._progress_cb(i + 1, total)
+        for start in range(0, total, batch_size):
+            batch = texts[start:start + batch_size]
+            try:
+                resp = self._llm.create_embedding(batch)
+                sorted_items = sorted(resp["data"], key=lambda x: x["index"])
+                for item in sorted_items:
+                    results.append(item["embedding"])
+            except Exception:
+                for text in batch:
+                    resp = self._llm.create_embedding(text)
+                    results.append(resp["data"][0]["embedding"])
+            if self._progress_cb:
+                self._progress_cb(min(start + batch_size, total), total)
         return results
 
     def embed_query(self, text: str) -> List[float]:
@@ -182,9 +198,9 @@ class GGUFEmbeddingBackend:
 
 # ── 工厂方法 ──
 
-def create_embedding_backend(preset):
+def create_embedding_backend(preset, batch_size: int = 32):
     if preset.backend_type == "huggingface":
-        return HuggingFaceEmbeddingBackend(preset)
+        return HuggingFaceEmbeddingBackend(preset, batch_size=batch_size)
     elif preset.backend_type == "onnx":
         return ONNXEmbeddingBackend(preset)
     elif preset.backend_type == "gguf":

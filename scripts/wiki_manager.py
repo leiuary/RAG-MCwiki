@@ -16,10 +16,12 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 import requests
+import msvcrt
 
 try:
     from wiki_cleaner import clean_html, html_to_markdown
@@ -53,7 +55,7 @@ EXPORT_ERROR_LOG = "data/extract_errors.jsonl"
 HTML_CACHE_DIR = "data/html_cache"
 ZIM_HTML_CACHE_DIR = os.path.join(HTML_CACHE_DIR, "zim")
 API_HTML_CACHE_DIR = os.path.join(HTML_CACHE_DIR, "api")
-CLOUD_PROGRESS_FILE = "test/cloud_update_progress.json"
+CLOUD_PROGRESS_FILE = "data/cloud_update_progress.json"
 
 REQUEST_DELAY_SECONDS = 0.1
 REVISION_BATCH_SIZE = 50
@@ -577,6 +579,14 @@ def save_cloud_progress(data: dict) -> None:
     write_json(CLOUD_PROGRESS_FILE, data)
 
 
+def list_all_namespaces() -> list[int]:
+    """返回需要爬取的内容命名空间（白名单）。"""
+    # 0: 主命名空间（百科正文）
+    # 9998: Tutorial（教程）
+    # 10010: China Edition（中国版）
+    return [0, 9998, 10010]
+
+
 def list_all_titles(resume: bool = True) -> list[str]:
     progress = load_cloud_progress() if resume else {}
     titles = progress.get("titles", [])
@@ -589,50 +599,59 @@ def list_all_titles(resume: bool = True) -> list[str]:
     if titles:
         print(f"  从断点继续: 已有 {len(titles)} 个标题")
 
+    # 查询所有命名空间
+    namespaces = list_all_namespaces()
+    print(f"  共 {len(namespaces)} 个命名空间")
+
     consecutive_failures = 0
-    while True:
-        params = {
-            "action": "query",
-            "list": "allpages",
-            "apnamespace": 0,
-            "aplimit": 500,
-            "apfilterredir": "nonredirects",
-            "format": "json",
-        }
-        params.update(continue_params)
-
-        try:
-            data = api_request(params)
-            consecutive_failures = 0
-        except Exception as e:
-            consecutive_failures += 1
-            save_cloud_progress({
-                "stage": "titles",
-                "titles": titles,
-                "continue": continue_params,
-            })
-            print(f"\n  API 请求失败 ({consecutive_failures}/3): {e}")
-            if consecutive_failures >= 3:
-                print("  已保存进度，稍后可继续")
-                break
-            time.sleep(5)
-            continue
-
-        pages = data.get("query", {}).get("allpages", [])
-        titles.extend(p["title"] for p in pages if "title" in p)
-
-        if "continue" not in data:
+    for ns in namespaces:
+        if progress.get("stage") in ("titles_done", "revisions", "revisions_done"):
             break
 
-        continue_params = data["continue"]
-        if len(titles) % 2000 == 0:
-            save_cloud_progress({
-                "stage": "titles",
-                "titles": titles,
-                "continue": continue_params,
-            })
-        print(f"\r  已收集 {len(titles)} 个标题...", end="", flush=True)
-        time.sleep(REQUEST_DELAY_SECONDS)
+        continue_params = {}
+        while True:
+            params = {
+                "action": "query",
+                "list": "allpages",
+                "apnamespace": ns,
+                "aplimit": 500,
+                "apfilterredir": "nonredirects",
+                "format": "json",
+            }
+            params.update(continue_params)
+
+            try:
+                data = api_request(params)
+                consecutive_failures = 0
+            except Exception as e:
+                consecutive_failures += 1
+                save_cloud_progress({
+                    "stage": "titles",
+                    "titles": titles,
+                    "continue": continue_params,
+                })
+                print(f"\n  API 请求失败 ({consecutive_failures}/3): {e}")
+                if consecutive_failures >= 3:
+                    print("  已保存进度，稍后可继续")
+                    break
+                time.sleep(5)
+                continue
+
+            pages = data.get("query", {}).get("allpages", [])
+            titles.extend(p["title"] for p in pages if "title" in p)
+
+            if "continue" not in data:
+                break
+
+            continue_params = data["continue"]
+            if len(titles) % 2000 == 0:
+                save_cloud_progress({
+                    "stage": "titles",
+                    "titles": titles,
+                    "continue": continue_params,
+                })
+            print(f"\r  已收集 {len(titles)} 个标题...", end="", flush=True)
+            time.sleep(REQUEST_DELAY_SECONDS)
 
     if titles:
         save_cloud_progress({
@@ -819,48 +838,59 @@ def cmd_update(workers: int | None = None) -> None:
     os.makedirs(API_HTML_CACHE_DIR, exist_ok=True)
     ensure_parent(EXPORT_ERROR_LOG)
 
+    n_workers = max(1, workers or 4)
     html_items: list[tuple[str, str, str]] = []
     fetched = 0
     skipped = 0
+    errors = 0
     t0 = time.time()
 
-    print(f"阶段 1/2: 从 API 获取 HTML ({len(changed):,} 页)")
-    for title in changed:
+    print(f"阶段 1/2: 从 API 获取 HTML ({len(changed):,} 页, {n_workers} 线程)")
+
+    def fetch_one(title: str) -> tuple[str, str | None, str | None]:
         stem = safe_filename(title)
         html_path = os.path.join(API_HTML_CACHE_DIR, stem + ".html")
         out_path = os.path.join(EXPORT_OUTPUT_DIR, stem + ".md")
 
-        if os.path.exists(html_path):
-            html_items.append((title, html_path, out_path))
-            skipped += 1
-            continue
-
         try:
             html_raw = fetch_page_html(title)
-        except Exception as e:
-            print(f"\n  获取失败: {title}: {e}")
-            continue
+        except Exception:
+            return title, None, None, False
 
         if not html_raw:
-            continue
+            return title, None, None, False
 
         write_raw_html(html_path, title, html_raw, source="API")
-        html_items.append((title, html_path, out_path))
-        fetched += 1
+        return title, html_path, out_path, False
 
-        if (fetched + skipped) % 100 == 0:
-            elapsed = time.time() - t0
-            rate = (fetched + skipped) / elapsed if elapsed > 0 else 0
-            print(
-                f"\r  [{fetched + skipped:,}/{len(changed):,}  "
-                f"{rate:.0f} 页/秒  获取: {fetched}  跳过: {skipped}]",
-                end="",
-                flush=True,
-            )
-        time.sleep(REQUEST_DELAY_SECONDS)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(fetch_one, title): title for title in changed}
+
+        for future in as_completed(futures):
+            title, html_path, out_path, skipped_flag = future.result()
+
+            if html_path and os.path.exists(html_path):
+                if skipped_flag:
+                    skipped += 1
+                else:
+                    fetched += 1
+                html_items.append((title, html_path, out_path))
+            else:
+                errors += 1
+
+            done = fetched + skipped + errors
+            if done % 100 == 0 or done == len(changed):
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                print(
+                    f"\r  [{done:,}/{len(changed):,}  "
+                    f"{rate:.0f} 页/秒  获取: {fetched}  跳过: {skipped}  错误: {errors}]",
+                    end="",
+                    flush=True,
+                )
 
     print(
-        f"\nHTML: 获取 {fetched:,}  跳过 {skipped:,}  "
+        f"\nHTML: 获取 {fetched:,}  跳过 {skipped:,}  错误 {errors:,}  "
         f"耗时 {(time.time() - t0) / 60:.1f} 分钟"
     )
 
@@ -886,12 +916,70 @@ def cmd_update(workers: int | None = None) -> None:
 # TUI and CLI
 # ---------------------------------------------------------------------------
 
+def select_option(options: list[str], prompt: str = "  >", console=None) -> int:
+    """上下方向键选择选项，Enter 确认，Esc 取消返回 -1。"""
+    if console is None:
+        from rich.console import Console
+        console = Console()
+
+    selected = 0
+    n = len(options)
+
+    def _render():
+        for i, opt in enumerate(options):
+            if i == selected:
+                console.print(f"  [reverse]{prompt} {opt}[/reverse]     ")
+            else:
+                console.print(f"    {opt}     ")
+
+    # 首次渲染
+    _render()
+
+    while True:
+        ch = msvcrt.getwch()
+        # 方向键前缀
+        if ch in ('\x00', '\xe0'):
+            ch2 = msvcrt.getwch()
+            if ch2 == 'H':      # Up
+                selected = (selected - 1) % n
+            elif ch2 == 'P':    # Down
+                selected = (selected + 1) % n
+            else:
+                continue
+        elif ch == '\r':        # Enter
+            # 清除选项行
+            for _ in range(n):
+                sys.stdout.write("\033[A\033[2K")
+            sys.stdout.flush()
+            return selected
+        elif ch == '\x1b':      # Esc
+            for _ in range(n):
+                sys.stdout.write("\033[A\033[2K")
+            sys.stdout.flush()
+            return -1
+        else:
+            continue
+
+        # 重绘
+        for _ in range(n):
+            sys.stdout.write("\033[A\033[2K")
+        sys.stdout.flush()
+        _render()
+
+
 def interactive_tui() -> None:
     from rich.console import Console
-    from rich.prompt import Prompt
 
     console = Console()
     banner = "  [bold]Minecraft Wiki 数据管理工具[/]\n"
+
+    MENU = [
+        ("提取单页 (ZIM + API)", "e"),
+        ("云端获取/更新元数据 (查询 cloud_date)", "c"),
+        ("全量导出 ZIM (基于云端元数据)", "x"),
+        ("增量更新数据 (从 API 拉取变动页面)", "u"),
+        ("退出", "q"),
+    ]
 
     while True:
         console.clear()
@@ -911,28 +999,26 @@ def interactive_tui() -> None:
             f"local_date: {has_local} | cloud_date: {has_cloud} | 待更新: {pending}[/]"
         )
         console.print()
-        console.print("  [[bold]E[/]] 提取单页 (ZIM + API)")
-        console.print("  [[bold]C[/]] 云端获取/更新元数据 (查询 cloud_date)")
-        console.print("  [[bold]X[/]] 全量导出 ZIM (基于云端元数据)")
-        console.print("  [[bold]U[/]] 增量更新数据 (从 API 拉取变动页面)")
-        console.print("  [[bold]Q[/]] 退出")
-        console.print()
 
-        choice = Prompt.ask("  >", choices=["e", "c", "x", "u", "q"]).lower()
+        idx = select_option([label for label, _ in MENU], prompt=">", console=console)
+        action = MENU[idx][1] if idx >= 0 else "q"
 
-        if choice == "q":
+        if action == "q":
             break
-        if choice == "e":
-            title = Prompt.ask("  页面标题")
-            cmd_extract(title)
-        elif choice == "c":
+        elif action == "e":
+            console.print()
+            title = input("  页面标题: ").strip()
+            if title:
+                cmd_extract(title)
+        elif action == "c":
             cmd_cloud_update()
-        elif choice == "x":
+        elif action == "x":
             cmd_export()
-        elif choice == "u":
+        elif action == "u":
             cmd_update()
 
-        Prompt.ask("  [dim]按回车继续[/]", default="", show_default=False)
+        console.print("\n  [dim]按任意键继续...[/]")
+        msvcrt.getwch()
 
 
 def build_parser() -> argparse.ArgumentParser:

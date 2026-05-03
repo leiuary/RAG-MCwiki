@@ -1,112 +1,227 @@
-# ⛏️ Minecraft Wiki 知识库智能助手 (RAG-MCwiki)
+# Minecraft Wiki 知识库智能助手 (RAG-MCwiki)
 
-本项目是一个专为 **Minecraft** 玩家和研究者设计的本地化知识检索增强生成（RAG）系统。通过采集并结构化 Minecraft Wiki 数据（2026/4/22），结合本地大模型（Local LLM）与云端 API，实现精准、低延迟、无幻觉的游戏机制问答。
+基于 RAG（检索增强生成）的 Minecraft Wiki 知识问答系统。采集中文 Minecraft Wiki 数据，通过 ChromaDB 建立向量索引，结合本地或云端 LLM 生成有据可依的回答。
 
-## 🌟 核心特性
+## 核心特性
 
-  **全本地化隐私安全**：支持通过 LM Studio 驱动本地模型（如 Qwen3.5），数据无需上传云端。  
-  **混合检索优化**：结合了 `Jieba` 分词的关键词提取与 `ChromaDB` 的语义向量检索，大幅提升专有名词召回率。  
-  **结构化知识感知**：针对 Wiki 的 JSON 数据进行分层解析，保留 Markdown 标题结构，增强模型对上下文的理解。  
-  **实时流式响应**：基于 Streamlit 的流式输出技术，实现毫秒级的首字响应（TTFT）。  
-  **透明化溯源**：每条回答均附带参考来源折叠面板，支持查看原始 Wiki 链接。  
-  **开发者调试模式**：内置 Debug 面板，实时展示发送给 AI 的实际 Prompt 组装内容。  
+- **混合检索**：BM25 + 向量 RRF 融合检索，短语匹配加成 + 标题/概述页重排序，覆盖专有名词和社区黑话
+- **多模型嵌入**：支持 HuggingFace / ONNX / GGUF 三种嵌入后端，运行时一键切换
+- **流式对话**：SSE 实时推送，首字响应 < 1s，支持中途停止生成
+- **透明溯源**：每条回答附带参考来源，支持查看原始 Wiki 链接
+- **专业调试**：内置全链路追踪面板，展示查询改写、检索片段、Token 统计、各阶段耗时
+- **Bot API**：`/chat/bot` 端点支持 QQ Bot 等外部接入，自带会话管理和 Bearer Token 认证
 
-## 🛠️ 技术栈
+## 技术栈
 
-  **前端交互**：Streamlit  
-  **大模型编排**：LangChain (Core / Community / Classic)  
-  **向量数据库**：ChromaDB (Persistent Storage)  
-  **词向量模型**：`shibing624/text2vec-base-chinese` (HuggingFace)  
-  **分词引擎**：Jieba  
-  **模型支持**：LM Studio (OpenAI 兼容接口) / DeepSeek API  
+| 层 | 技术 |
+|---|------|
+| 前端 | Next.js 16 + React 19 + Tailwind CSS + shadcn/ui |
+| 后端 | FastAPI + LangChain + ChromaDB + rank_bm25 |
+| 嵌入模型 | Yuan-embedding-2.0-zh / Qwen3-Embedding-0.6B / gte-small-zh (ONNX) |
+| 分词 | Jieba（中文分词 + BM25 索引） |
+| LLM | LM Studio (本地) / DeepSeek API (云端) — OpenAI 兼容协议 |
+| 数据源 | 中文 Minecraft Wiki ZIM 离线包 + MediaWiki API 增量更新 |
 
-## 📂 项目结构
+## 项目结构
 
 ```text
 .
-├── rag_app.py              # Streamlit 主程序
-├── structured_output/      # 存放清洗后的结构化 Wiki JSON 文件
-├── chroma_db/              # 向量数据库持久化目录（自动生成）
-├── requirements.txt        # 依赖列表
-└── README.md               # 项目说明文档
+├── backend/
+│   ├── main.py                    # FastAPI 入口
+│   ├── app/
+│   │   ├── api/endpoints.py       # REST API 路由
+│   │   ├── core/
+│   │   │   ├── config.py          # 配置管理（pydantic-settings，支持 .env）
+│   │   │   ├── rag_engine.py      # RAG 对话引擎（查询改写 + 检索 + 生成）
+│   │   │   ├── kb_manager.py      # 知识库管理器（向量库 CRUD + 倒排索引）
+│   │   │   ├── embedding_registry.py  # 嵌入模型预设注册表
+│   │   │   └── embedding_backends.py  # 嵌入后端工厂（HF / ONNX / GGUF）
+│   │   └── schemas/chat.py        # Pydantic 请求/响应模型
+│   └── requirements.txt
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx               # 主聊天页（SSE 流式 + Markdown 渲染）
+│   │   └── services/api.ts        # API 客户端
+│   ├── components/
+│   │   ├── LeftSidebar.tsx        # 知识库状态 + 嵌入模型选择
+│   │   ├── RightSidebar.tsx       # 推理配置面板
+│   │   └── ProfessionalTrace.tsx  # 全链路追踪面板
+│   └── package.json
+├── scripts/
+│   ├── wiki_manager.py            # Wiki 数据管理（ZIM 导出 + API 增量更新）
+│   ├── wiki_cleaner.py            # HTML → Markdown 清洗
+│   ├── manage_kb.py               # 知识库管理 TUI（Embedding 构建/切换/清理 + BM25 构建）
+│   ├── dev-up.ps1                 # 开发环境启动脚本
+│   └── dev-down.ps1               # 开发环境停止脚本
+├── data/
+│   ├── markdown/                  # 清洗后的 Markdown 文件（8300+ 篇）
+│   ├── chroma_db/                 # 向量数据库 + BM25 索引缓存（按模型分目录）
+│   ├── html_cache/                # HTML 缓存（ZIM + API 双源）
+│   └── page_metadata.json         # 页面元数据（增量同步用）
+├── .env.example                   # 环境变量模板
+├── CLAUDE.md                      # Claude Code 项目指南
+└── start-dev.bat / stop-dev.bat   # Windows 一键启停
 ```
 
-## 🚀 快速开始
+## 快速开始
 
-### 一键启动（Windows PowerShell）
-
-如果你觉得手动开两个服务太麻烦，可以直接用脚本：
+### 一键启动（Windows）
 
 ```powershell
+# 同时启动前后端
 powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1
-```
 
-这个脚本会自动：
-- 启动后端 FastAPI（`http://localhost:8000`）
-- 启动前端 Next.js（`http://localhost:3000`）
-- 如果前端缺少依赖，会自动 `npm install`
-
-可选参数：
-
-```powershell
 # 仅启动后端
 powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -SkipFrontend
 
 # 仅启动前端
 powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -SkipBackend
 
-# 不自动安装前端依赖
-powershell -ExecutionPolicy Bypass -File .\scripts\dev-up.ps1 -NoInstall
-```
-
-停止服务（按端口 8000/3000 关闭）：
-
-```powershell
+# 停止全部
 powershell -ExecutionPolicy Bypass -File .\scripts\dev-down.ps1
 ```
 
-也可以直接双击根目录下的批处理文件：
+或直接双击 `start-dev.bat` / `stop-dev.bat`。
 
-- `start-dev.bat`：启动前后端
-- `stop-dev.bat`：停止前后端
+### 手动启动
 
-### 1. 环境准备
-确保你的环境中已安装 Python 3.10+。建议使用虚拟环境：
+**1. 后端**
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # Windows 使用 venv\Scripts\activate
+# 创建虚拟环境
+python -m venv .venv
+.venv\Scripts\activate
 
-# 推荐：先安装带 GPU 加速的 PyTorch (如果你的电脑有 NVIDIA 显卡)
+# 安装依赖（如需 GPU 加速，先安装 CUDA 版 PyTorch）
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install -r backend/requirements.txt
 
-# 安装其他核心依赖
-pip install -r requirements.txt
+# 配置环境变量（可选）
+cp .env.example .env
+# 编辑 .env 设置 BOT_API_KEY、LLM 地址等
+
+# 启动
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 2. 数据准备
-将结构化的 Minecraft Wiki 数据（JSON 格式）放入 `./structured_output` 文件夹中。数据应包含 `title`, `source_url`, `structured_content` 或 `text` 字段。
+**2. 前端**
 
-### 3. 配置大模型
-  **本地模式**：启动 **LM Studio**，加载模型，并开启 Local Server（默认端口 1234）。  
-  **云端模式**：获取 **DeepSeek API Key**。  
-
-### 4. 运行应用
 ```bash
-streamlit run rag_app.py
+cd frontend
+npm install
+npm run dev
 ```
 
-## 📝 技术要点说明
+访问 `http://localhost:3000`。
 
-### 语义检索逻辑
-系统采用 `RecursiveCharacterTextSplitter` 将文档切分为 500 字的片段，并保留 50 字的重叠（Overlap）。检索时，系统会先对用户提问进行 `Jieba` 分词，将“原句 + 核心关键词”共同投入向量空间进行多路召回，通过内容去重后选取最相关的 Top-3 片段。
+**3. 构建知识库**
 
-### 双后端切换
-在 `get_qa_chain` 函数中，系统通过修改 `base_url` 实现了对标准 OpenAI 协议的“接口劫持”。无论使用本地算力还是云端算力，业务逻辑均保持一致。
+```bash
+# 交互式 TUI（含 Embedding 构建/切换/清理 + BM25 构建）
+python scripts/manage_kb.py
 
-### 缓存优化
-利用 `@st.cache_resource` 装饰器，确保高权重的 Embedding 模型和向量数据库仅在启动时加载一次，避免 Streamlit 响应式机制导致的重复加载开销。
+# 或直接构建 Embedding（使用默认模型）
+python scripts/manage_kb.py build
 
----
+# 构建 BM25 索引（独立于 Embedding，可单独运行）
+python scripts/manage_kb.py bm25
+```
 
-**提示**：在使用本地模型时，请确保显存充足。若遇到网络连接问题（如无法下载 Embedding 模型），代码已内置镜像站 `hf-mirror.com` 的重定向逻辑。
+### 配置
+
+所有配置项均可通过环境变量或 `.env` 文件覆盖，参见 `.env.example`：
+
+**模型与地址**
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `EMBEDDING_MODEL_ID` | `yuan2-hf` | 嵌入模型（yuan2-hf / qwen3-hf / qwen3-gguf / gte-quant） |
+| `LOCAL_LLM_URL` | `http://localhost:1234/v1` | 本地 LLM 地址 |
+| `DEEPSEEK_API_URL` | `https://api.deepseek.com` | 云端 LLM 地址 |
+| `BOT_API_KEY` | _(空)_ | Bot API 认证密钥（未设置则跳过认证） |
+
+**检索参数**
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RETRIEVAL_K` | `20` | 向量检索每个搜索词返回条数 |
+| `BM25_ENABLED` | `true` | 是否启用 BM25+RRF 混合检索 |
+| `BM25_K1` | `1.5` | BM25 词频饱和度（典型 1.2-2.0） |
+| `BM25_B` | `0.75` | BM25 文档长度归一化（0=不归一化，1=完全归一化） |
+| `BM25_TOP_K` | `20` | BM25 返回条数 |
+| `RRF_K` | `60` | RRF 融合常数（典型 30-100） |
+| `MAX_CONTEXT_CHARS` | `7000` | 召回片段总字数上限 |
+| `QUERY_REWRITE_COUNT` | `3` | LLM 改写搜索词数量 |
+| `QUERY_REWRITE_TIMEOUT` | `5.0` | 查询改写超时秒数 |
+| `PER_TITLE_CAP` | `3` | 同一标题最多保留条数 |
+
+**重排序加成**
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `TITLE_EXACT_BOOST` | `0.01` | 标题精确匹配加成（RRF 模式） |
+| `TITLE_SUBSTR_BOOST` | `0.005` | 标题子串匹配加成（RRF 模式） |
+| `OVERVIEW_BOOST_RRF` | `0.003` | 概述页加成（RRF 模式） |
+| `QUERY_PHRASE_BOOST` | `0.025` | 原始查询短语匹配加成 |
+| `PHRASE_STOP_WORDS` | `版本,什么,...` | 短语匹配停用词（逗号分隔） |
+| `OVERVIEW_BOOST_KEYWORD` | `6` | 概述页加成（关键词模式） |
+| `KEYWORD_TITLE_EXACT_BOOST` | `10` | 标题精确匹配加成（关键词模式） |
+| `KEYWORD_TITLE_SUBSTR_BOOST` | `5` | 标题子串匹配加成（关键词模式） |
+| `KEYWORD_CONTENT_BOOST` | `1` | 内容匹配加成（关键词模式） |
+
+## RAG 流程
+
+```
+用户提问
+  → 查询改写（版本号走规则扩展，其余走 LLM 生成 3 个搜索短语）
+  → 双路并行检索
+      ├─ 向量检索：每个搜索词 → ChromaDB top-K（默认 20）
+      └─ BM25 检索：jieba 分词 → BM25Okapi top-K（默认 20）
+  → RRF 融合：score = Σ 1/(k + rank_i)，叠加标题/概述页/短语匹配加成
+  → 多样性过滤：同标题最多 3 条
+  → 字数截断：按相关性排序累加到 MAX_CONTEXT_CHARS（默认 7000 字）
+  → 文档送入 LangChain stuff chain
+  → LLM 流式生成 → SSE 推送前端（每条来源标注 vector / bm25 / both）
+```
+
+## API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/chat` | SSE 流式对话（前端用） |
+| `POST` | `/api/v1/chat/bot` | JSON 对话（Bot 接入，需 Bearer Token） |
+| `POST` | `/api/v1/models` | 获取可用模型列表 |
+| `GET` | `/api/v1/knowledge_base/status` | 知识库状态（含 Embedding 模型信息） |
+| `GET` | `/api/v1/knowledge_base/models` | 所有嵌入模型列表及构建状态 |
+| `POST` | `/api/v1/knowledge_base/switch_model` | 运行时切换嵌入模型 |
+| `GET` | `/api/v1/health` | 健康检查 |
+
+## 数据更新
+
+```bash
+# 1. 从 MediaWiki API 获取全站页面元数据
+python scripts/wiki_manager.py meta
+
+# 2. 从 ZIM 离线包导出 HTML（首次全量）
+python scripts/wiki_manager.py export
+
+# 3. 增量更新变更页面
+python scripts/wiki_manager.py update
+
+# 4. 构建/更新 Embedding 向量库
+python scripts/manage_kb.py build
+
+# 5. 构建/更新 BM25 索引（独立于 Embedding，直接读取 markdown 文件）
+python scripts/manage_kb.py bm25
+```
+
+## 已知限制
+
+- **社区黑话**：Jieba 分词对"刷线机"等社区俗称有效（整词保留），但 LLM 改写可能丢失原始关键词，依赖短语匹配加成兜底
+- **版本号区分**：向量检索无法区分 `26.1` 与 `26.10`，已通过规则扩展缓解
+- **知识库覆盖**：部分问题（如 mod 生态历史）知识库中无对应文章，依赖 LLM 自身知识
+- **短 chunk**：知识库中存在大量 stub 页面（< 50 字），向量检索可能召回这些低价值片段
+
+## License
+
+本项目仅供学习和个人使用。Wiki 内容遵循 [CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/) 协议。

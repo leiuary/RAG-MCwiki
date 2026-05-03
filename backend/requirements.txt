@@ -1,6 +1,7 @@
 fastapi>=0.110.0
 uvicorn>=0.28.0
 pydantic>=2.6.0
+pydantic-settings>=2.0.0
 jieba>=0.42.1
 langchain-core>=0.1.30
 langchain-community>=0.0.27
@@ -11,6 +12,7 @@ langchain-classic>=0.0.1
 chromadb>=0.4.24
 sentence-transformers>=2.5.1
 requests>=2.31.0
+rank_bm25>=0.2.2
 
 # ── 可选：ONNX 嵌入后端 (gte-quant) ──
 # pip install onnxruntime
